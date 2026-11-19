@@ -7,12 +7,12 @@ from pathlib import Path
 import pandas as pd
 
 from .cache import default_runs_dir
-from .pipeline import find_view
 from .mapillary import MapillaryError
+from .pipeline import find_view
 from .streetview import StreetViewError
-from .verify import auto_choice
 
-ROW_OVERRIDES = ('target', 'target_notes', 'target_height_m', 'built_date', 'radius_m', 'n_candidates', 'position_uncertainty_m')
+ROW_OVERRIDES = ('target_height_m', 'built_date', 'radius_m', 'n_images', 'min_visible_fraction',
+                 'position_uncertainty_m')
 
 
 def _sites_table(sites):
@@ -21,7 +21,8 @@ def _sites_table(sites):
     else:
         df = pd.DataFrame(sites)
     df.columns = [c.strip().lower() for c in df.columns]
-    df = df.rename(columns={'latitude': 'lat', 'longitude': 'lon', 'lng': 'lon', 'id': 'site_id'})
+    df = df.rename(columns={'latitude': 'lat', 'longitude': 'lon', 'lng': 'lon', 'id': 'site_id',
+                            'height': 'target_height_m', 'height_m': 'target_height_m'})
     missing = {'lat', 'lon'} - set(df.columns)
     if missing:
         raise ValueError(f'Sites table needs columns lat and lon (missing {sorted(missing)})')
@@ -35,67 +36,69 @@ def _sites_table(sites):
 
 def _summary_row(site_id, summary, out_root):
     best = summary.get('best') or {}
-    params = summary.get('parameters', {})
     t = summary.get('target', {})
-    return {'site_id': site_id, 'lat': t.get('lat'), 'lon': t.get('lon'), 'found': summary.get('found'),
+    images = summary.get('images', [])
+    return {'site_id': site_id, 'lat': t.get('lat'), 'lon': t.get('lon'),
             'target_height_m': t.get('height_m'), 'height_source': t.get('height_source'),
-            'n_panoramas': summary.get('n_panoramas'), 'n_images': summary.get('n_image_requests'),
-            'n_candidates_requested': params.get('n_candidates'), 'verifier': params.get('verifier'),
-            'best_pano_id': best.get('pano_id'), 'best_rank': best.get('rank'),
+            'n_panoramas': summary.get('n_panoramas'), 'n_images': len(images),
+            'n_mapillary_images': sum(i.get('source') == 'mapillary' for i in images),
+            'n_google_images': sum(i.get('source') == 'google' for i in images),
+            'best_source': best.get('source'), 'best_pano_id': best.get('pano_id'), 'best_rank': best.get('rank'),
+            'best_score': best.get('score'), 'best_visible_fraction': best.get('visible_fraction'),
             'best_distance_m': best.get('distance_m'), 'best_heading': best.get('heading_to_target'),
-            'best_confidence': best.get('verified_confidence'), 'best_lat': best.get('lat'),
-            'best_lon': best.get('lon'), 'best_pano_date': best.get('pano_date'),
+            'best_lat': best.get('lat'), 'best_lon': best.get('lon'), 'best_pano_date': best.get('pano_date'),
             'best_image': f"{site_id}/{best['image']}" if best.get('image') else None, 'error': None}
 
 
-def _already_done(result_json, n_candidates, verifier, radius_m=300):
-    """Skip a site if it was found before, or already ran with at least as many images, the same verifier and
-    at least this search radius (a wider radius reruns sites that got no image)."""
+def _already_done(result_json, n_images, radius_m=300):
+    """Skip a site that already got n_images images, or that already ran asking for at least as many with at
+    least this search radius (a wider radius reruns sites that got fewer images than they asked for)."""
     try:
         s = json.loads(Path(result_json).read_text(encoding='utf-8'))
     except (OSError, ValueError):
         return None
     p = s.get('parameters', {})
-    wider = radius_m > p.get('radius_m', 300) and not s.get('n_image_requests')
-    if s.get('found') or (p.get('n_candidates', -1) >= n_candidates and (p.get('verifier') is None) == (verifier is None)
-                          and not wider):
+    if 'n_images' not in p:  # a run folder from an older version
+        return None
+    got = len(s.get('images', []))
+    wider = radius_m > p.get('radius_m', 300) and got < p['n_images']
+    if got >= n_images or (p['n_images'] >= n_images and not wider):
         return s
     return None
 
 
-def find_views(sites, *, out_root=None, resume=True, max_images_total=None, summary_name='summary', log=print,
-               **kwargs):
+def find_views(sites, *, out_root=None, resume=True, max_google_images_total=None, summary_name='summary',
+               log=print, **kwargs):
     """Run find_view for every row of `sites` and write <out_root>/summary.csv and summary.gpkg.
 
-    sites : CSV path, DataFrame or list of dicts with lat, lon and optionally site_id (also accepts
-        latitude/longitude/id). Per-row columns override keyword arguments: target, target_notes,
-        target_height_m, built_date, radius_m, n_candidates, position_uncertainty_m.
+    sites : CSV path, DataFrame or list of dicts with lat, lon and optionally site_id and target_height_m
+        (also accepts latitude/longitude/id/height). Per-row columns override keyword arguments:
+        target_height_m, built_date, radius_m, n_images, min_visible_fraction, position_uncertainty_m.
     out_root : parent folder; each site goes to <out_root>/<site_id>. Default ./streetsight_runs (see cache.py).
-    resume : skip sites whose result.json shows they were found, or already ran with at least as many
-        images and the same kind of verifier.
-    max_images_total : cap on billed images across the whole batch. When it is used up, remaining
-        sites are still ranked (free) with n_candidates=0.
+    resume : skip sites that already have their images (see _already_done).
+    max_google_images_total : cap on billed Google images across the whole batch. When it is used up,
+        remaining sites still get Mapillary images.
     summary_name : base name of the summary files (useful when several batches share out_root).
-    **kwargs : passed to find_view (verifier, n_candidates, radius_m, ...).
+    **kwargs : passed to find_view (n_images, radius_m, providers, ...).
 
-    A Street View key or quota error, or a refused Mapillary token, stops the batch; any other per-site error is recorded and the
-    batch continues. Returns the summary DataFrame.
+    A Street View key or quota error, or a refused Mapillary token, stops the batch; any other per-site
+    error is recorded and the batch continues. Returns the summary DataFrame.
     """
     df = _sites_table(sites)
     out_root = Path(out_root) if out_root else default_runs_dir()
     out_root.mkdir(parents=True, exist_ok=True)
-    rows, used = [], 0
+    rows, billed = [], 0
     for i, site in enumerate(df.to_dict('records'), 1):
         sid = site['site_id']
         kw = {**kwargs, **{k: site[k] for k in ROW_OVERRIDES if k in site and pd.notna(site[k])}}
-        n = int(kw.get('n_candidates', 5))
-        if max_images_total is not None:
-            n = max(0, min(n, max_images_total - used))
-        kw['n_candidates'] = n
+        if 'n_images' in kw:
+            kw['n_images'] = int(kw['n_images'])
+        if max_google_images_total is not None:
+            left = max(0, max_google_images_total - billed)
+            cap = kw.get('max_google_images')
+            kw['max_google_images'] = left if cap is None else min(left, cap)
         out_dir = out_root / sid
-        verifier = kw.get('verifier', 'auto')
-        verifier = auto_choice() if verifier == 'auto' else verifier
-        prior = (_already_done(out_dir / 'result.json', n, verifier, float(kw.get('radius_m', 300)))
+        prior = (_already_done(out_dir / 'result.json', kw.get('n_images', 3), float(kw.get('radius_m', 300)))
                  if resume else None)
         log(f'[{i}/{len(df)}] {sid} ({site["lat"]:.6f}, {site["lon"]:.6f})' + (' - already done' if prior else ''))
         if prior:
@@ -104,7 +107,7 @@ def find_views(sites, *, out_root=None, resume=True, max_images_total=None, summ
         try:
             find_view(float(site['lat']), float(site['lon']), site_id=sid, out_dir=out_dir, log=log, **kw)
             summary = json.loads((out_dir / 'result.json').read_text(encoding='utf-8'))
-            used += summary.get('n_image_requests', 0)
+            billed += summary.get('n_image_requests', 0)
             rows.append(_summary_row(sid, summary, out_root))
         except (StreetViewError, MapillaryError) as exc:
             rows.append({'site_id': sid, 'lat': site['lat'], 'lon': site['lon'], 'error': str(exc)})
@@ -117,8 +120,9 @@ def find_views(sites, *, out_root=None, resume=True, max_images_total=None, summ
             log(f'{sid}: error {exc!r}; continuing')
     summary = pd.DataFrame(rows)
     _write_summary(summary, out_root, summary_name)
-    found = int(summary['found'].fillna(False).astype(bool).sum()) if 'found' in summary else 0
-    log(f'Batch done: {found}/{len(summary)} found, {used} images downloaded this run. Summary: {out_root / (summary_name + ".csv")}')
+    with_image = int((summary['n_images'].fillna(0) > 0).sum()) if 'n_images' in summary else 0
+    log(f'Batch done: {with_image}/{len(summary)} sites have at least one image; {billed} billed Google images '
+        f'this run. Summary: {out_root / (summary_name + ".csv")}')
     return summary
 
 

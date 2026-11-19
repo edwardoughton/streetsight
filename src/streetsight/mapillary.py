@@ -7,7 +7,7 @@ works in any shell). It is sent in a header, never in a URL, so it does not end 
 Mapillary images cannot be re-aimed on the server the way Google Street View can:
 - 360-degree panoramas are downloaded whole and cropped here to an aimed view (heading, pitch, fov).
 - Ordinary (perspective) photos are kept only if the target lies inside their field of view. They are used as
-  taken, and the verifier is told where in the frame the target should be.
+  taken, with target_offset_deg recording where in the frame the target should be.
 """
 import datetime
 import io

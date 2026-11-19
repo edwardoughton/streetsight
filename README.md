@@ -1,33 +1,34 @@
 # streetsight
 
-Give it the coordinates and height of a tall structure; it finds a street-level photo that shows it.
+Give it the coordinates and height of a tall structure; it downloads the street-level images most likely to show it.
 
-streetsight downloads the buildings, trees, terrain and roads around the target and checks every candidate camera position for line of sight before downloading anything. It tries free [Mapillary](https://www.mapillary.com/) imagery first and falls back to Google Street View. Images are fetched best-first until a verifier (Claude, a review file, or your own function) confirms the target is visible.
+streetsight looks at the buildings, trees, terrain and roads around the target and works out, for every available camera position, how much of the target should be visible from there. It then downloads the best views, aimed at the target: from free [Mapillary](https://www.mapillary.com/) imagery first, and from Google Street View only for what Mapillary cannot supply.
 
-It works anywhere in the world: every data source is global, read remotely a window at a time, and needs no account. The US gets higher-resolution terrain where it is available.
+It works anywhere in the world: every data source is global, read remotely a small window at a time, and needs no account. The US gets higher-resolution terrain.
 
 ```python
 import streetsight
 
-result = streetsight.find_view(42.025504, -93.646039, target_height_m=34, target="campanile")
-print(result)            # FOUND on attempt N: <source> image <id> at <distance> m, saved as images/...jpg
-result.best              # dict for the confirmed image
+result = streetsight.find_view(42.025504, -93.646039, 34)   # latitude, longitude, height in metres
+print(result)            # N images (by provider); best: <source> <id> at <distance> m, <share> predicted visible
+result.images            # downloaded views, best first, each with its predicted visibility
 result.candidates        # every camera position found, ranked
 
-summary = streetsight.find_views("sites.csv", n_candidates=5, max_images_total=200)
+summary = streetsight.find_views("sites.csv")    # columns lat, lon, and optionally site_id, target_height_m
 ```
 
 From a terminal:
-- one site: `streetsight 42.025504 -93.646039 --target-height 34 --target campanile`
-- many sites: `streetsight --sites sites.csv --max-images-total 200`
+- one site: `streetsight 42.025504 -93.646039 34`
+- many sites: `streetsight --sites sites.csv --max-google-images 200`
 - Mapillary only (no Google costs): add `--providers mapillary`
-- ranking only, no image downloads: add `--candidates 0`
+- rank camera positions without downloading: add `--images 0`
+
+streetsight predicts what each camera can see; it does not look at the images. A view it ranks highly can still miss the target if the map data is out of date or the target's coordinates are off.
 
 ## Install
 
 ```bash
-pip install streetsight            # core
-pip install "streetsight[claude]"  # plus the Claude image verifier
+pip install streetsight
 ```
 
 Credentials are read from environment variables:
@@ -36,14 +37,12 @@ Credentials are read from environment variables:
 |---|---|
 | `MAPILLARY_ACCESS_TOKEN` | Mapillary (free; create a client token at mapillary.com/dashboard/developers) |
 | `GOOGLE_MAPS_API_KEY` | Google Street View (Street View Static API enabled; images are billed) |
-| `ANTHROPIC_API_KEY` | the Claude verifier |
 
-A provider without credentials is skipped with a message. On Windows, variables set with `[Environment]::SetEnvironmentVariable(..., 'User')` are picked up for Mapillary even in shells opened before they were set.
+A provider without credentials is skipped with a message. On Windows, a Mapillary token set with `[Environment]::SetEnvironmentVariable(..., 'User')` is picked up even in shells opened before it was set.
 
 ## What one call does
 
-1. **Target height.** `target_height_m=` if given, else 30 m. Look the height up yourself (for example from a national tower register) and pass it in, with `built_date` if you know it.
-2. **Clutter and roads**, downloaded in parallel for the search area:
+1. **Clutter and roads**, downloaded in parallel for the search area:
 
    | Layer | Source | Resolution | Coverage |
    |---|---|---|---|
@@ -53,32 +52,27 @@ A provider without credentials is skipped with a message. On Windows, variables 
    | Terrain (bare earth) | USGS 3DEP where available, else GEDTM30 | 10 m / 30 m | US / global except Antarctica |
    | Roads | Overture transportation segments | per segment | global |
 
-   Each run records which sources it used (`terrain`, `building_height_sources` in `result.json`).
-3. **Line of sight.** For each camera position, streetsight computes how high up the target the view clears buildings, trees and the ground. Heights are measured from the ground at the target's base, so cameras above or below the target are handled. The score combines the visible part with distance. It is a ranking heuristic between 0 and 1, not a calibrated probability. Images taken before the target's `built_date` are down-weighted to a tenth.
-4. **Providers, in order** (`providers=("mapillary", "google")`):
-   - **Mapillary.** One search returns every image within `radius_m`. 360° panoramas are kept and cropped locally to a view aimed at the target. Ordinary photos are kept only if the target lies within their horizontal field of view and its unobstructed part reaches into their vertical one; they are used as taken, and the verifier is told where in the frame to look. The best-scoring images are downloaded, at least `min_separation_m` apart, because consecutive frames of one sequence share the same obstructions.
-   - **Google Street View**, only if Mapillary gave no confirmed image. Points are sampled every `road_spacing_m` along roads, scored locally, and Street View metadata is queried at the best points first (`search="ranked"`). The search stops at `target_panoramas` panoramas, after 16 queries in a row that found nothing new, or at `max_metadata_queries`. Metadata requests are free but count against quota; image requests are billed.
-5. **Download and verify.** Images are aimed at the target, with pitch and field of view chosen so the visible part fits in the frame. Close views are widened to allow for `position_uncertainty_m` of error in the target coordinates. The run stops at the first image the verifier confirms with confidence of at least `min_confidence`, or after `n_candidates` images per provider.
+2. **Line of sight.** For each camera position, streetsight computes how high up the target the view clears buildings, trees and the ground, giving the fraction of the target predicted visible. Heights are measured from the ground at the target's base, so cameras above or below the target are handled. A score combines visibility with distance (closer is better, scaled to the target's height) and ranks the views. Images taken before the target's `built_date`, if given, are down-weighted.
+3. **Mapillary.** One search returns every image within `radius_m`. 360° panoramas are cropped locally to a view aimed at the target. Ordinary photos are kept only if the target lies inside their field of view; they are used as taken, and `target_offset_deg` records where in the frame the target should be. The best views with at least `min_visible_fraction` of the target predicted visible are downloaded, at least `min_separation_m` apart, because neighbouring frames of one sequence share the same obstructions.
+4. **Google Street View**, only if Mapillary supplied fewer than `n_images`. Points are sampled every `road_spacing_m` along roads and scored locally first; Street View metadata is then queried at the best points only (`search="ranked"`), which is free but counts against quota. The best panoramas fill the remaining places; each image is billed.
+5. **Aiming.** Pitch and field of view are chosen so the visible part of the target fits in the frame. Close views are widened to allow for `position_uncertainty_m` of error in the target coordinates.
 
-## Key parameters
+## Parameters
 
 | Parameter | Default | Meaning |
 |---|---|---|
-| `target_height_m` | 30 | Target height above ground |
-| `target` | `"structure"` | What to look for, used in the verifier prompt |
-| `target_notes` | `""` | Extra verifier guidance, e.g. which look-alikes to reject |
-| `providers` | `("mapillary", "google")` | Imagery sources, tried in order |
+| `target_height_m` | 30 | Target height above ground (third positional argument) |
+| `n_images` | 3 | Images to download; 0 ranks camera positions only |
+| `min_visible_fraction` | 0.25 | Download only views with at least this fraction of the target predicted visible |
+| `providers` | `("mapillary", "google")` | Imagery sources, in order of preference |
+| `max_google_images` | none | Cap on billed Google images for the call |
 | `site_id` | none | Run folder name; without it, a timestamp and the coordinates |
 | `radius_m` | 300 | Largest camera-to-target distance searched |
-| `n_candidates` | 5 | Most images downloaded per provider; 0 = rank only |
-| `verifier` | `"auto"` | `"auto"` (Claude if `ANTHROPIC_API_KEY` is set, else none), `"claude"`, `None`, a review CSV, or a callable |
-| `min_confidence` | 0.6 | Verifier confidence needed to stop |
 | `built_date` | none | Construction date, if known; images taken before it are down-weighted |
 | `position_uncertainty_m` | 10 | Possible error in the target coordinates; widens close views |
 | `min_separation_m` | 15 | Mapillary: minimum distance between downloaded images |
 | `road_spacing_m` | 30 | Google: spacing of candidate points along roads |
 | `search` | `"ranked"` | Google: `"ranked"` queries the best points first; `"exhaustive"` queries every point |
-| `target_panoramas` | max(10, 2 × `n_candidates`) | Google: ranked search stops after this many panoramas |
 | `max_metadata_queries` | 60 | Google: cap on metadata requests per site |
 | `use_buildings`, `use_canopy`, `use_terrain` | True | Turn individual data sources off |
 | `terrain_source` | `"auto"` | `"auto"` (3DEP in the US, else GEDTM30), `"3dep"` or `"gedtm30"` |
@@ -86,39 +80,20 @@ A provider without credentials is skipped with a message. On Windows, variables 
 | `out_dir` | `./streetsight_runs/<site_id>` | Run folder |
 | `cache_dir` | per-user cache folder | Downloaded Overture data |
 
-### Verifiers
-
-A verifier is any callable `f(image_path, context) -> {"visible", "confidence", "reason"}`. `context` holds the target, distance, heading, pitch, field of view, height, image source and, for photos that could not be aimed, `target_offset_deg` (where in the frame the target should be).
-
-To check images by hand, pass a review CSV with columns `image`, `visible`, `confidence` and `reason`:
-1. Run with `n_candidates=1`.
-2. Fill in the CSV.
-3. Rerun with `n_candidates=2`. Images already on disk are reused without being downloaded or billed again, and the next image is fetched only where none has been confirmed.
-
-Images missing from the CSV, or marked `unclear`, count as unconfirmed.
-
-For targets with common look-alikes, add guidance, for example for cell towers:
-
-```python
-find_view(lat, lon, target="cell tower", target_height_m=45,
-          target_notes="Do not count utility poles, streetlights, flagpoles or electricity pylons. "
-                       "Disguised towers (a 'monopine' tree, a steeple) count if the structure is identifiable.")
-```
-
 ## Batch runs
 
-`find_views(sites, ...)` accepts a CSV path, a DataFrame or a list of dicts, with columns `lat`/`lon` (or `latitude`/`longitude`) and optionally `site_id` (or `id`). Per-site columns override keyword arguments: `target`, `target_notes`, `target_height_m`, `built_date`, `radius_m`, `n_candidates` and `position_uncertainty_m`.
+`find_views(sites, ...)` accepts a CSV path, a DataFrame or a list of dicts, with columns `lat`/`lon` (or `latitude`/`longitude`) and optionally `site_id` (or `id`) and `target_height_m` (or `height`). Per-site columns override keyword arguments: `target_height_m`, `built_date`, `radius_m`, `n_images`, `min_visible_fraction` and `position_uncertainty_m`.
 
-Each site gets its own run folder. The parent folder also gets `summary.csv` (one row per site) and `summary.gpkg` (layers `sites`, `best_cameras` and `best_sight_lines`).
+Each site gets its own run folder. The parent folder also gets `summary.csv` (one row per site: images found per provider, and the best view) and `summary.gpkg` (layers `sites`, `best_cameras` and `best_sight_lines`).
 
-Re-running a batch skips sites already found, and sites that already ran with at least as many images and the same kind of verifier. `max_images_total` caps billed Google images across the batch; once it is reached, the remaining sites are still ranked. A Google key or quota error, or a refused Mapillary token, stops the batch. Any other error is written to that site's `error.txt` and the batch continues.
+Re-running a batch skips sites that already have their images; images already on disk are never downloaded again. `max_google_images_total` (`--max-google-images` with `--sites`) caps billed Google images across the batch; once it is used up, the remaining sites still get Mapillary images. A Google key or quota error, or a refused Mapillary token, stops the batch. Any other error is written to that site's `error.txt` and the batch continues.
 
 ## Run folder
 
-- `images/`: downloaded views. Google images are named `rank01_<distance>m_h<heading>_<pano>.jpg`; Mapillary images start `mly_`.
+- `images/`: the downloaded views. Google images are named `rank01_<distance>m_h<heading>_<pano>.jpg`; Mapillary images start `mly_`.
 - `results.gpkg` (open in QGIS): `target`, `search_area`, `sample_points` (Google road points, with predicted score and query order), `panoramas` (every camera position, ranked and scored), `sight_lines`, `view_wedges`, `roads`, `buildings`
 - `canopy_height.tif`, `terrain.tif`: the clips used for the line-of-sight check
-- `candidates.csv`, `result.json`: every number behind the ranking, and the verifier verdicts
+- `candidates.csv`, `result.json`: every number behind the ranking, the data sources used, and the downloaded images
 - `requests.csv`: every request, with keys and tokens removed
 - `index.html`: contact sheet of the downloaded images
 
@@ -133,13 +108,12 @@ Re-running a batch skips sites already found, and sites that already ran with at
 
 ## Limits
 
-- **Mapillary orientation:** panoramas are cropped assuming their middle column faces Mapillary's computed compass angle. User-contributed imagery can be mis-oriented or blurry, so a crop may miss the target even with a clear line of sight.
-- **Terrain:** the 10 m (US) and 30 m (global) elevation models smooth narrow features such as embankments and cuttings, and the 20 m nearest each end of the sight line is ignored.
+- **Predicted, not checked:** visibility is computed from map data; the images themselves are not analysed.
 - **Building heights:** outside North America and Europe most buildings have no Overture height or floor count, and get the GHS-BUILT-H average for their 100 m cell (2018). A tall building in a low-rise cell is under-estimated, and new buildings are missed.
 - **Trees:** canopy is treated as opaque, and its effect is discounted in the score. The canopy data comes from roughly 2018–2020 imagery and under-estimates tall single trees, especially street trees beside the camera.
+- **Terrain:** the 10 m (US) and 30 m (global) elevation models smooth narrow features such as embankments and cuttings, and the 20 m nearest each end of the sight line is ignored.
 - **Other clutter** (walls, noise barriers, bridges, signs, vehicles) is not modelled.
-- **Mapillary photo quality** varies; blurred or badly oriented photos are only caught by the verifier.
-- **Dates:** only the image month is compared with the construction date; demolition and replacement are not checked.
+- **Mapillary** photos are contributed by users: some are blurred or mis-oriented. Panoramas are cropped assuming their middle column faces Mapillary's computed compass angle.
 - **Google coverage:** the metadata API returns only the nearest panorama to each sample point, so rarely used side roads may be missed.
 
 ## Data, licences and terms
@@ -154,12 +128,12 @@ Re-running a batch skips sites already found, and sites that already ran with at
 | Mapillary imagery | CC BY-SA 4.0; credit Mapillary and the contributor (recorded in `copyright`) |
 | Google Street View | Google Maps Platform Terms |
 
-Google's terms limit caching Street View content and may restrict sending it to third-party analysis services. Check your agreement before keeping images long-term or using the Claude verifier at scale.
+Google's terms limit caching Street View content. Check your agreement before keeping Google images long-term.
 
 ## Development
 
 ```bash
-pip install -e ".[claude,test]"
+pip install -e ".[test]"
 pytest
 ```
 

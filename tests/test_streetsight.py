@@ -180,65 +180,70 @@ class FakeClient:
 
 
 class PipelineTests(unittest.TestCase):
-    def run_find(self, verifier, **kw):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def run_find(self, **kw):
         road = LineString([(TOWER[1], TOWER[0] - 100 / M), (TOWER[1], TOWER[0] + 100 / M)])
         roads = gpd.GeoDataFrame({'id': ['r'], 'subtype': ['road'], 'class': ['residential']},
                                  geometry=[road], crs='EPSG:4326')
         tall = {'id': 'tall', 'height': 30.0, 'num_floors': None,
                 'geometry': box(TOWER[1] - 0.0003, TOWER[0] + 40 / M, TOWER[1] + 0.0003, TOWER[0] + 50 / M)}
         bld = overture.assign_heights(gpd.GeoDataFrame([tall], crs='EPSG:4326'))
-        self.tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.tmp.cleanup)
         with mock.patch.object(pipeline, 'StreetViewClient', FakeClient), \
                 mock.patch.object(pipeline.overture, 'roads', return_value=roads), \
                 mock.patch.object(pipeline.overture, 'buildings', return_value=bld):
-            return pipeline.find_view(*TOWER, target_height_m=40, radius_m=150, verifier=verifier,
-                                      out_dir=Path(self.tmp.name) / 'run', use_canopy=False, use_ghs_heights=False,
-                                      use_terrain=False, log=lambda *_: None, **{'providers': ['google'], **kw})
+            return pipeline.find_view(*TOWER, 40, radius_m=150, out_dir=Path(self.tmp.name) / 'run',
+                                      use_canopy=False, use_ghs_heights=False, use_terrain=False,
+                                      log=lambda *_: None, **{'providers': ['google'], **kw})
 
-    def test_ranks_clear_view_first_and_stops_when_verified(self):
-        seen = []
-        result = self.run_find(lambda path, ctx: seen.append(ctx) or {'visible': True, 'confidence': 0.9, 'reason': 'ok'})
-        self.assertTrue(result.found)
+    def test_downloads_visible_view_and_skips_hidden_one(self):
+        result = self.run_find()
+        self.assertEqual([p['pano_id'] for p in result.images], ['clear'])  # 'blocked' is fully hidden
         self.assertEqual(result.best['pano_id'], 'clear')
-        self.assertEqual(len(result.attempts), 1)
-        self.assertAlmostEqual(seen[0]['heading'], 0, delta=0.1)
+        self.assertAlmostEqual(result.best['image_heading'], 0, delta=0.1)
+        self.assertEqual(len(result.candidates), 2)
         out = result.out_dir
         for f in ('results.gpkg', 'candidates.csv', 'requests.csv', 'result.json', 'index.html'):
             self.assertTrue((out / f).is_file(), f)
         self.assertTrue((out / result.best['image']).is_file())
         layers = {row[0] for row in __import__('pyogrio').list_layers(out / 'results.gpkg')}
         self.assertTrue({'target', 'panoramas', 'sight_lines', 'view_wedges', 'buildings', 'roads'} <= layers)
+        summary = __import__('json').loads((out / 'result.json').read_text())
+        self.assertEqual((summary['n_images'], summary['best']['pano_id']), (1, 'clear'))
 
-    def test_moves_to_next_candidate_when_not_visible(self):
-        result = self.run_find(lambda p, c: {'visible': False, 'confidence': 0.9, 'reason': 'tree'})
-        self.assertFalse(result.found)
-        self.assertEqual([a['pano_id'] for a in result.attempts], ['clear', 'blocked'])
+    def test_min_visible_fraction_zero_takes_hidden_views_too(self):
+        result = self.run_find(min_visible_fraction=0)
+        self.assertEqual([p['pano_id'] for p in result.images], ['clear', 'blocked'])
 
-    def test_second_pass_reuses_rank1_and_downloads_rank2_only_if_unconfirmed(self):
-        from streetsight.verify import ReviewFileVerifier
-        first = self.run_find(None, n_candidates=1)
-        out = first.out_dir
-        img = Path(first.attempts[0]['image']).name
-        review = out.parent / 'review.csv'
-        review.write_text('image,visible,confidence,reason\n' + f'{img},no,0.9,tree\n', encoding='utf-8')
-        with mock.patch.object(pipeline, 'StreetViewClient', FakeClient):
-            road = LineString([(TOWER[1], TOWER[0] - 100 / M), (TOWER[1], TOWER[0] + 100 / M)])
-            roads = gpd.GeoDataFrame({'id': ['r'], 'subtype': ['road'], 'class': ['x']}, geometry=[road], crs='EPSG:4326')
-            with mock.patch.object(pipeline.overture, 'roads', return_value=roads),                     mock.patch.object(pipeline.overture, 'buildings', return_value=None):
-                second = pipeline.find_view(*TOWER, target_height_m=40, radius_m=150, n_candidates=2,
-                                            verifier=ReviewFileVerifier(review), out_dir=out, use_canopy=False,
-                                            use_ghs_heights=False, use_terrain=False, log=lambda *_: None,
-                                            providers=['google'])
-        statics = [r for r in __import__('json').loads((out / 'result.json').read_text())['attempts']]
-        self.assertEqual([a['verified_visible'] for a in statics], [False, None])
-        n_static = sum(1 for line in (out / 'requests.csv').read_text().splitlines() if line.startswith('static'))
-        self.assertEqual(n_static, 1)  # only rank 2 was billed on the second pass
+    def test_rerun_reuses_images_already_downloaded(self):
+        self.run_find()
+        self.run_find()
+        n_static = sum(1 for line in (Path(self.tmp.name) / 'run' / 'requests.csv').read_text().splitlines()
+                       if line.startswith('static'))
+        self.assertEqual(n_static, 0)  # second run billed nothing
 
-    def test_no_verifier_downloads_all_candidates(self):
-        result = self.run_find(None, n_candidates=1)
-        self.assertFalse(result.found)
-        self.assertEqual(len(result.attempts), 1)
+    def test_rerun_reuses_image_whose_rank_changed(self):
+        first = self.run_find()
+        img = first.out_dir / first.best['image']
+        img.rename(img.with_name(img.name.replace('rank01_', 'rank07_')))  # as if ranked 7th last time
+        second = self.run_find()
+        self.assertTrue((second.out_dir / second.best['image']).is_file())
+        n_static = sum(1 for line in (second.out_dir / 'requests.csv').read_text().splitlines()
+                       if line.startswith('static'))
+        self.assertEqual(n_static, 0)
+        self.assertEqual(len(list((second.out_dir / 'images').glob('*.jpg'))), 1)
+
+    def test_rank_only(self):
+        result = self.run_find(n_images=0)
+        self.assertEqual(result.images, [])
+        self.assertIsNone(result.best)
+        self.assertEqual(len(result.candidates), 2)
+
+    def test_google_cap(self):
+        result = self.run_find(min_visible_fraction=0, max_google_images=1)
+        self.assertEqual(len(result.images), 1)
 
 
 
@@ -305,20 +310,23 @@ class BatchTests(unittest.TestCase):
         calls = []
 
         def fake_find_view(lat, lon, *, site_id, out_dir, log, **kw):
-            calls.append((site_id, kw['n_candidates']))
+            calls.append((site_id, kw.get('target_height_m'), kw.get('max_google_images')))
             out_dir.mkdir(parents=True, exist_ok=True)
-            best = {'pano_id': 'p', 'rank': 1, 'distance_m': 50, 'heading_to_target': 10, 'lat': lat - 0.0005,
-                    'lon': lon, 'image': 'images/x.jpg', 'verified_confidence': 0.9}
+            img = {'source': 'google', 'pano_id': 'p', 'rank': 1, 'distance_m': 50, 'heading_to_target': 10,
+                   'lat': lat - 0.0005, 'lon': lon, 'image': 'images/x.jpg', 'visible_fraction': 0.8}
             (out_dir / 'result.json').write_text(__import__('json').dumps({
-                'found': True, 'best': best, 'target': {'lat': lat, 'lon': lon, 'height_m': 30},
-                'parameters': {'n_candidates': kw['n_candidates'], 'verifier': 'm'},
+                'best': img, 'images': [img, {**img, 'pano_id': 'q'}],
+                'target': {'lat': lat, 'lon': lon, 'height_m': kw.get('target_height_m') or 30},
+                'parameters': {'n_images': kw.get('n_images', 3), 'radius_m': 300},
                 'n_panoramas': 3, 'n_image_requests': 2}))
 
-        sites = [{'id': 'A', 'latitude': 41.0, 'longitude': -88.0}, {'id': 'B/2', 'latitude': 41.1, 'longitude': -88.1}]
+        sites = [{'id': 'A', 'latitude': 41.0, 'longitude': -88.0, 'height': 45},
+                 {'id': 'B/2', 'latitude': 41.1, 'longitude': -88.1}]
         with mock.patch.object(batch, 'find_view', fake_find_view):
-            s = batch.find_views(sites, out_root=Path(tmp.name), max_images_total=3, log=lambda *_: None)
-            self.assertEqual(calls, [('A', 3), ('B_2', 1)])
-            self.assertEqual(list(s['found']), [True, True])
+            s = batch.find_views(sites, out_root=Path(tmp.name), max_google_images_total=3, log=lambda *_: None)
+            self.assertEqual(calls, [('A', 45, 3), ('B_2', None, 1)])  # per-site height; Google budget shrinks
+            self.assertEqual(list(s['n_images']), [2, 2])
+            self.assertEqual(list(s['best_source']), ['google', 'google'])
             self.assertTrue((Path(tmp.name) / 'summary.gpkg').is_file())
             layers = {r[0] for r in __import__('pyogrio').list_layers(Path(tmp.name) / 'summary.gpkg')}
             self.assertEqual(layers, {'sites', 'best_cameras', 'best_sight_lines'})

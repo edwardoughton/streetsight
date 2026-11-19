@@ -1,9 +1,9 @@
-"""find_view: one call from a coordinate to a verified street-level image of the target.
+"""find_view: from a coordinate and height to the street-level images most likely to show the target.
 
 Imagery providers are tried in order (default: free Mapillary, then paid Google Street View). Each provider's
-camera positions are ranked by line of sight to the target, past buildings, trees and terrain, and
-downloaded best-first until the verifier confirms the target. Later providers are not queried at all once
-an earlier one has succeeded.
+camera positions are ranked by line of sight to the target, past buildings, trees and terrain, and the best
+are downloaded, aimed at the target. A later provider is queried only for images an earlier one could not
+supply.
 """
 import math
 import re
@@ -19,7 +19,6 @@ from .export import write_outputs
 from .geometry import bbox_around, bearing_distance, framing
 from .mapillary import MapillaryClient, MapillaryError, in_vertical_view
 from .streetview import StreetViewClient, StreetViewError
-from .verify import resolve
 from .visibility import building_los, canopy_los, combine, ground_offsets, score, terrain_los
 
 DEFAULT_TARGET_HEIGHT_M = 30.0
@@ -79,21 +78,28 @@ def pick_spread(items, n, min_separation_m):
 
 
 @dataclass
-class FindViewResult:
-    found: bool
-    best: dict | None
+class ViewResult:
+    """images: downloaded views, best first (Mapillary, then Google). candidates: every camera position
+    ranked, from every provider queried. target: the target record (location, height, data sources)."""
+    images: list = field(repr=False)
     out_dir: Path
     target: dict
     candidates: list = field(repr=False)
-    attempts: list = field(repr=False)
+
+    @property
+    def best(self):
+        """The top-ranked downloaded image (Mapillary before Google), or None."""
+        return self.images[0] if self.images else None
 
     def __str__(self):
         head = f'streetsight result in {self.out_dir}\n'
-        if self.found:
-            b = self.best
-            return head + (f"FOUND on attempt {len(self.attempts)}: {b.get('source', 'google')} image {b['pano_id']} "
-                           f"at {b['distance_m']} m, heading {b['heading_to_target']}, saved as {b['image']}")
-        return head + f'NOT FOUND after {len(self.attempts)} attempts ({len(self.candidates)} camera positions ranked)'
+        if not self.images:
+            return head + f'No image downloaded ({len(self.candidates)} camera positions ranked)'
+        by = ', '.join(f"{sum(p['source'] == s for p in self.images)} {s}" for s in PROVIDERS
+                       if any(p['source'] == s for p in self.images))
+        b = self.best
+        return head + (f"{len(self.images)} images ({by}); best: {b['source']} {b['pano_id']} at {b['distance_m']} m, "
+                       f"{b['visible_fraction']:.0%} predicted visible, {b['image']}")
 
 
 def load_layers(lat, lon, radius_m, out_dir, cache_dir, use_buildings=True, use_canopy=True, use_terrain=True,
@@ -168,32 +174,30 @@ def _make_client(name, google_api_key, mapillary_token):
     raise ValueError(f'Unknown provider {name!r}: use "mapillary" and/or "google"')
 
 
-def find_view(lat, lon, *, target_height_m=None, target='structure', target_notes='', providers=PROVIDERS,
-              radius_m=300, n_candidates=5, verifier='auto', min_confidence=0.6, out_dir=None, site_id=None,
-              google_api_key=None, mapillary_token=None, road_spacing_m=30, search='ranked', target_panoramas=None,
+def find_view(lat, lon, target_height_m=None, *, n_images=3, min_visible_fraction=0.25, providers=PROVIDERS,
+              max_google_images=None, radius_m=300, out_dir=None, site_id=None, google_api_key=None,
+              mapillary_token=None, road_spacing_m=30, search='ranked', target_panoramas=None,
               max_metadata_queries=60, max_sample_points=1500, camera_height_m=2.5, position_uncertainty_m=10.0,
               min_separation_m=15.0, built_date=None, use_buildings=True, use_canopy=True, use_terrain=True,
               terrain_source='auto', use_ghs_heights=True, cache_dir=None, log=print):
-    """Find a street-level image that shows the target at (lat, lon).
+    """Download the street-level images most likely to show the target at (lat, lon).
 
-    For each provider in turn, camera positions are ranked by line of sight to the target, then images are
-    downloaded best-first until the verifier confirms the target is visible.
+    Camera positions are ranked by line of sight to the target past buildings, trees and terrain. The best
+    n_images with at least min_visible_fraction of the target predicted visible are downloaded, aimed at the
+    target: from Mapillary first, then from Google Street View for any places Mapillary could not fill.
 
     Parameters
     ----------
     lat, lon : target location (WGS84).
-    target_height_m : height above ground (default 30 m).
-    target : short description used in the verifier prompt, e.g. "water tower", "cell tower".
-    target_notes : extra guidance for the verifier, e.g. what look-alikes to reject.
+    target_height_m : height of the target above ground (default 30 m).
+    n_images : how many images to download. 0 ranks camera positions only (no downloads).
+    min_visible_fraction : only download views where at least this fraction of the target's height is
+        predicted to be visible (0-1).
     providers : imagery sources, tried in order: "mapillary" (free, needs MAPILLARY_ACCESS_TOKEN) and
         "google" (Street View Static API; metadata free, images billed; needs GOOGLE_MAPS_API_KEY). A
         provider without credentials is skipped with a message; it is an error if none can be used.
+    max_google_images : cap on billed Google images for this call (default: no cap beyond n_images).
     radius_m : maximum camera-to-target distance searched.
-    n_candidates : maximum images downloaded per provider. 0 ranks only (no image downloads).
-    verifier : "auto" (default: Claude if credentials are set, else None), "claude", None (download all
-        n_candidates for human review, no early stop), a review CSV path, or a callable
-        verifier(image_path, context) -> {"visible", "confidence", "reason"}.
-    min_confidence : verifier confidence required to stop.
     out_dir : folder for images and outputs. Default <runs>/<site_id>, or <runs>/<timestamp>_<lat>_<lon>
         without a site_id (see cache.py for <runs>).
     site_id : name for the run folder and outputs.
@@ -202,7 +206,7 @@ def find_view(lat, lon, *, target_height_m=None, target='structure', target_note
     road_spacing_m : spacing of candidate Google camera points along roads.
     search : Google only. "ranked" (default) scores every road point for line of sight locally first, then
         queries Street View metadata at the best points only, stopping at target_panoramas panoramas
-        (default max(10, 2 * n_candidates)) or when queries stop finding new ones. "exhaustive" queries
+        (default max(10, 2 * images still needed)) or when queries stop finding new ones. "exhaustive" queries
         every road point.
     max_metadata_queries : cap on Google metadata queries per site (free, but they count against quota).
     max_sample_points : cap on local road points; spacing grows to respect it.
@@ -217,8 +221,10 @@ def find_view(lat, lon, *, target_height_m=None, target='structure', target_note
     use_ghs_heights : fill missing Overture building heights from GHS-BUILT-H (100 m average, global).
     cache_dir : download cache for Overture (default per-user cache folder).
 
-    Returns FindViewResult; everything is also written to out_dir (see export.write_outputs).
+    Returns ViewResult; everything is also written to out_dir (see export.write_outputs).
     """
+    if not 0 <= min_visible_fraction <= 1:
+        raise ValueError('min_visible_fraction must be between 0 and 1')
     if isinstance(providers, str):
         providers = [providers]
     for name in providers:
@@ -240,10 +246,9 @@ def find_view(lat, lon, *, target_height_m=None, target='structure', target_note
             log(f'Skipping {name}: {exc}')
     if not clients:
         raise RuntimeError('No imagery provider can be used: ' + '; '.join(f'{k}: {v}' for k, v in skipped.items()))
-    check = resolve(verifier, log=log)
 
     # 1. Target height.
-    tgt = {'site_id': site_id, 'lat': lat, 'lon': lon, 'target': target, 'height_m': target_height_m,
+    tgt = {'site_id': site_id, 'lat': lat, 'lon': lon, 'height_m': target_height_m,
            'height_source': 'user' if target_height_m else None, 'built_date': built_date}
     if tgt['height_m'] is None:
         tgt.update(height_m=DEFAULT_TARGET_HEIGHT_M, height_source='assumed_default')
@@ -259,15 +264,18 @@ def find_view(lat, lon, *, target_height_m=None, target='structure', target_note
     los = dict(lat=lat, lon=lon, H=H, buildings=buildings, canopy_tif=canopy_tif, ground=ground, z_t=z_t,
                camera_h=camera_height_m, built_date=tgt['built_date'])
 
-    # 3-5. Per provider: candidates, line of sight and ranking, then download best-first until verified.
-    all_panos, attempts, best, sample_records, sampling, used = [], [], None, [], {}, []
+    # 3-5. Per provider: candidates, line of sight and ranking, then download the best that pass.
+    all_panos, images, sample_records, sampling, used = [], [], [], {}, []
     for name, client in clients.items():
-        if best is not None:
-            break
+        need = n_images - len(images)
+        if name == 'google' and max_google_images is not None:
+            need = min(need, max_google_images)
+        if n_images > 0 and need <= 0:
+            break  # enough images already; with n_images=0 every provider is ranked
         used.append(name)
         if name == 'google':
             panos, sample_records, sampling = _google_candidates(
-                client, roads, los, lat, lon, radius_m, n_candidates, search, road_spacing_m, target_panoramas,
+                client, roads, los, lat, lon, radius_m, max(need, 0), search, road_spacing_m, target_panoramas,
                 max_metadata_queries, max_sample_points, log)
             sep = 0.0
         else:
@@ -292,30 +300,29 @@ def find_view(lat, lon, *, target_height_m=None, target='structure', target_note
         for i, p in enumerate(panos, 1):
             p['rank'] = i
         all_panos += panos
-        best = _download_and_verify(client, name, pick_spread(panos, n_candidates, sep), out_dir, check, attempts,
-                                    target, target_notes, H, camera_height_m, position_uncertainty_m,
-                                    min_confidence, log)
+        eligible = [p for p in panos if p['visible_fraction'] >= min_visible_fraction]
+        picks = pick_spread(eligible, max(need, 0), sep)
+        log(f'{name}: {len(eligible)} of {len(panos)} views have at least {min_visible_fraction:.0%} of the target '
+            f'predicted visible; downloading {len(picks)}')
+        images += _download(client, name, picks, out_dir, H, camera_height_m, position_uncertainty_m, log)
 
-    result = FindViewResult(found=best is not None, best=best, out_dir=out_dir, target=tgt,
-                            candidates=all_panos, attempts=attempts)
+    result = ViewResult(images=images, out_dir=out_dir, target=tgt, candidates=all_panos)
     params = {'providers': list(providers), 'providers_used': used, 'providers_skipped': skipped,
-              'radius_m': radius_m, 'n_candidates': n_candidates, 'min_confidence': min_confidence,
-              'search': search, 'max_metadata_queries': max_metadata_queries, 'road_spacing_m': road_spacing_m,
+              'n_images': n_images, 'min_visible_fraction': min_visible_fraction,
+              'max_google_images': max_google_images, 'radius_m': radius_m, 'search': search, 'max_metadata_queries': max_metadata_queries, 'road_spacing_m': road_spacing_m,
               **sampling, 'min_separation_m': min_separation_m, 'camera_height_m': camera_height_m,
               'position_uncertainty_m': position_uncertainty_m, 'use_buildings': use_buildings,
               'use_canopy': use_canopy, 'use_terrain': use_terrain, 'terrain_source': terrain_source,
-              'use_ghs_heights': use_ghs_heights, **L['info'],
-              'verifier': getattr(check, 'model', None) or (None if check is None else 'custom')}
+              'use_ghs_heights': use_ghs_heights, **L['info']}
     request_log = [row for c in clients.values() for row in c.log]
     write_outputs(result, params, sample_records, buildings, roads, request_log)
     log(str(result))
     return result
 
 
-def _download_and_verify(client, source, picks, out_dir, check, attempts, target, target_notes, H, camera_height_m,
-                         position_uncertainty_m, min_confidence, log):
-    """Download picks best-first (reusing images already on disk), verify each, and return the first
-    confirmed one, or None. Appends every attempt to `attempts`."""
+def _download(client, source, picks, out_dir, H, camera_height_m, position_uncertainty_m, log):
+    """Download picks best-first, aimed at the target (reusing images already on disk). Returns the picks,
+    each with image, image_heading, pitch and fov added."""
     prefix = '' if source == 'google' else 'mly_'
     for p in picks:
         if source == 'mapillary' and not p.get('is_pano'):
@@ -328,6 +335,10 @@ def _download_and_verify(client, source, picks, out_dir, check, attempts, target
             p['image_heading'] = p['heading_to_target']
         name = f"{prefix}rank{p['rank']:02d}_{p['distance_m']:.0f}m_h{p['heading_to_target']:.0f}_{p['pano_id']}.jpg"
         path = out_dir / 'images' / name
+        earlier = [f for f in sorted(path.parent.glob(f"{prefix}rank*_{p['pano_id']}.jpg"))
+                   if f != path and f.stat().st_size]
+        if not (path.is_file() and path.stat().st_size) and earlier:
+            earlier[0].rename(path)  # same view downloaded before under another rank: not billed again
         if path.is_file() and path.stat().st_size:
             log(f'{source} rank {p["rank"]}: reusing {name} (already downloaded)')
         elif source == 'google':
@@ -335,18 +346,6 @@ def _download_and_verify(client, source, picks, out_dir, check, attempts, target
         else:
             path.write_bytes(client.image(p, p['heading_to_target'], p['pitch'], p['fov']))
         p['image'] = f'images/{name}'
-        verdict = {'visible': None, 'confidence': None, 'reason': 'not verified'}
-        if check:
-            ctx = {'target': target, 'target_notes': target_notes, 'distance_m': p['distance_m'],
-                   'heading': p['image_heading'], 'pitch': p['pitch'], 'fov': p['fov'],
-                   'visible_above_m': p['visible_above_m'], 'target_height_m': H,
-                   'source': 'Google Street View' if source == 'google' else 'Mapillary street-level',
-                   'target_offset_deg': p.get('target_offset_deg')}
-            verdict = check(path, ctx)
-        p.update({f'verified_{k}': v for k, v in verdict.items()})
-        attempts.append(p)
-        log(f"{source} rank {p['rank']}: score {p['score']} {p['distance_m']} m {p['visibility']} -> "
-            f"visible={verdict.get('visible')} conf={verdict.get('confidence')} ({verdict.get('reason')})")
-        if check and verdict.get('visible') and (verdict.get('confidence') or 0) >= min_confidence:
-            return p
-    return None
+        log(f"{source} rank {p['rank']}: score {p['score']}, {p['distance_m']} m, {p['visibility']}, "
+            f"{p['visible_fraction']:.0%} visible -> {name}")
+    return picks

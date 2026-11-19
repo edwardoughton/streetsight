@@ -11,7 +11,7 @@ import numpy as np
 from shapely.geometry import LineString
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
-from streetsight import cache, pipeline, verify  # noqa: E402
+from streetsight import cache, pipeline  # noqa: E402
 from streetsight.mapillary import (MapillaryError, in_vertical_view, perspective_fov,  # noqa: E402
                                    perspective_from_equirect, to_view)
 
@@ -121,55 +121,53 @@ class ProviderOrderTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
 
-    def run_find(self, verifier, mapillary=FakeMapillary, **kw):
+    def run_find(self, mapillary=FakeMapillary, **kw):
         road = LineString([(TOWER[1], TOWER[0] - 100 / M), (TOWER[1], TOWER[0] + 100 / M)])
         roads = gpd.GeoDataFrame({'id': ['r'], 'subtype': ['road'], 'class': ['x']}, geometry=[road], crs='EPSG:4326')
         with mock.patch.object(pipeline, 'MapillaryClient', mapillary), \
                 mock.patch.object(pipeline, 'StreetViewClient', FakeGoogle), \
                 mock.patch.object(pipeline.overture, 'roads', return_value=roads), \
                 mock.patch.object(pipeline.overture, 'buildings', return_value=None):
-            return pipeline.find_view(*TOWER, target_height_m=40, radius_m=150, verifier=verifier,
-                                      out_dir=Path(self.tmp.name) / 'run', use_canopy=False, use_terrain=False, use_ghs_heights=False,
+            return pipeline.find_view(*TOWER, 40, radius_m=150, out_dir=Path(self.tmp.name) / 'run',
+                                      use_canopy=False, use_terrain=False, use_ghs_heights=False,
                                       log=lambda *_: None, **kw)
 
-    def test_mapillary_success_never_touches_google(self):
-        seen = []
-        result = self.run_find(lambda p, c: seen.append(c) or {'visible': True, 'confidence': 0.9, 'reason': 'ok'})
-        self.assertTrue(result.found)
-        self.assertEqual(result.best['source'], 'mapillary')
+    def test_mapillary_fills_all_places_so_google_is_never_queried(self):
+        result = self.run_find(n_images=2)
+        self.assertEqual([p['source'] for p in result.images], ['mapillary', 'mapillary'])
         self.assertTrue(Path(result.best['image']).name.startswith('mly_rank01_'))
-        self.assertEqual(seen[0]['source'], 'Mapillary street-level')
         self.assertEqual(FakeGoogle.instances[0].log, [])  # no metadata, no billed images
         summary = json.loads((result.out_dir / 'result.json').read_text())
         self.assertEqual(summary['parameters']['providers_used'], ['mapillary'])
-        self.assertEqual((summary['n_image_requests'], summary['n_mapillary_images']), (0, 1))
+        self.assertEqual((summary['n_image_requests'], summary['n_mapillary_images']), (0, 2))
 
-    def test_falls_back_to_google_and_spreads_mapillary_picks(self):
-        result = self.run_find(lambda p, c: {'visible': False, 'confidence': 0.9, 'reason': 'trees'}, n_candidates=3)
-        self.assertFalse(result.found)
+    def test_google_fills_what_mapillary_cannot_and_picks_are_spread(self):
+        result = self.run_find(n_images=3)
         self.assertEqual(FakeMapillary.instances[0].images, ['11', '13'])  # 12 is 2 m from 11: skipped
         self.assertEqual(FakeGoogle.instances[0].images, ['g1'])
-        self.assertEqual([a['source'] for a in result.attempts], ['mapillary', 'mapillary', 'google'])
+        self.assertEqual([p['source'] for p in result.images], ['mapillary', 'mapillary', 'google'])
         layers = {row[0] for row in __import__('pyogrio').list_layers(result.out_dir / 'results.gpkg')}
         self.assertTrue({'target', 'panoramas', 'view_wedges', 'sample_points'} <= layers)
 
     def test_provider_without_credentials_is_skipped(self):
-        result = self.run_find(lambda p, c: {'visible': True, 'confidence': 0.9, 'reason': 'ok'}, mapillary=no_mapillary)
+        result = self.run_find(mapillary=no_mapillary)
         self.assertEqual(result.best['source'], 'google')
         summary = json.loads((result.out_dir / 'result.json').read_text())
         self.assertIn('mapillary', summary['parameters']['providers_skipped'])
 
     def test_no_usable_provider_is_an_error(self):
         with self.assertRaises(RuntimeError):
-            self.run_find(None, mapillary=no_mapillary, providers=['mapillary'])
+            self.run_find(mapillary=no_mapillary, providers=['mapillary'])
 
-    def test_unknown_provider(self):
+    def test_bad_arguments(self):
         with self.assertRaises(ValueError):
-            self.run_find(None, providers=['bing'])
+            self.run_find(providers=['bing'])
+        with self.assertRaises(ValueError):
+            self.run_find(min_visible_fraction=1.5)
 
     def test_mapillary_only_run_writes_outputs(self):
-        result = self.run_find(None, providers='mapillary', n_candidates=1)
-        self.assertEqual(len(result.attempts), 1)
+        result = self.run_find(providers='mapillary', n_images=1)
+        self.assertEqual(len(result.images), 1)
         self.assertTrue((result.out_dir / 'results.gpkg').is_file())
         self.assertIn('Mapillary', (result.out_dir / 'index.html').read_text(encoding='utf-8'))
 
@@ -187,19 +185,16 @@ class SettingsTests(unittest.TestCase):
             os.environ['STREETSIGHT_CACHE'] = 'c'
             self.assertEqual(cache.default_cache_dir(), Path('c'))
 
-    def test_auto_verifier_without_credentials_is_none(self):
-        with mock.patch.dict(os.environ, {'ANTHROPIC_API_KEY': '', 'ANTHROPIC_AUTH_TOKEN': ''}):
-            msgs = []
-            self.assertIsNone(verify.resolve('auto', log=msgs.append))
-            self.assertTrue(msgs)
 
-    def test_prompt_for_unaimed_photo_says_where_to_look(self):
-        text = verify.prompt({'target': 'mast', 'distance_m': 60, 'heading': 10, 'pitch': 0, 'fov': 70,
-                              'target_height_m': 20, 'source': 'Mapillary street-level', 'target_offset_deg': -12,
-                              'target_notes': 'Reject streetlights.'})
-        self.assertIn('12 deg to the left', text)
-        self.assertIn('Reject streetlights.', text)
-        self.assertIn('Mapillary', text)
+class CliTests(unittest.TestCase):
+    def test_lat_lon_height(self):
+        from streetsight import cli
+        with mock.patch.object(cli, 'find_view') as fv:
+            fv.return_value.images = ['x']
+            self.assertEqual(cli.main(['42.0', '-93.6', '34', '--images', '2', '--providers', 'mapillary']), 0)
+        args, kw = fv.call_args
+        self.assertEqual(args, (42.0, -93.6))
+        self.assertEqual((kw['target_height_m'], kw['n_images'], kw['providers']), (34.0, 2, ['mapillary']))
 
 
 if __name__ == '__main__':
