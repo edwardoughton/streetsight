@@ -1,14 +1,28 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "streetsight"
-version = "0.2.0"
-description = "Find the Street View panorama most likely to show a target, using building, canopy and FCC tower-height data"
+dynamic = ["version"]
+description = "Find a street-level image (Mapillary, then Google Street View) that shows a tall structure, using line of sight past buildings, trees and terrain"
 readme = "README.md"
 requires-python = ">=3.10"
-license = { file = "LICENSE" }
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Edward Oughton" }]
+keywords = ["street view", "mapillary", "line of sight", "geospatial", "overture", "infrastructure"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: GIS",
+]
 dependencies = [
     "requests>=2.32,<3",
     "numpy>=1.26,<3",
@@ -19,14 +33,27 @@ dependencies = [
     "pyogrio>=0.7",
     "pyarrow>=14",
     "rasterio>=1.4,<2",
+    "pillow>=10",
+    "platformdirs>=3",
 ]
 
 [project.optional-dependencies]
 claude = ["anthropic>=1.0"]
 test = ["pytest>=8"]
 
+[project.urls]
+Homepage = "https://github.com/edwardoughton/streetsight"
+Issues = "https://github.com/edwardoughton/streetsight/issues"
+Changelog = "https://github.com/edwardoughton/streetsight/blob/main/CHANGELOG.md"
+
 [project.scripts]
 streetsight = "streetsight.cli:main"
 
+[tool.setuptools.dynamic]
+version = { attr = "streetsight.__version__" }
+
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
