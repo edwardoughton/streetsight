@@ -4,8 +4,10 @@ A verifier is any callable  verifier(image_path, context) -> dict  with at least
   visible: bool | None   (None = could not decide)
   confidence: float 0-1
   reason: str
-context holds target, distance_m, heading, pitch, fov, visible_above_m, target_height_m.
+context holds target, distance_m, heading, pitch, fov, visible_above_m, target_height_m, and optionally
+source, target_notes and target_offset_deg (see prompt()).
 """
+import os
 import base64
 import json
 from pathlib import Path
@@ -24,20 +26,36 @@ SCHEMA = {
     'additionalProperties': False,
 }
 
-PROMPT = """This is a Google Street View image. The camera was aimed, using map coordinates, at a {target}
-about {distance_m:.0f} m away (compass heading {heading:.0f} deg, pitch {pitch:.0f} deg, horizontal field of view
-{fov:.0f} deg). If the coordinates are right and nothing blocks the view, the {target} should appear near the
-horizontal centre of the frame. Its registered height is about {target_height_m:.0f} m; buildings or trees may
-hide its lower part.
+PROMPT = """This is a {source} image. {aim}
+The {target} is about {distance_m:.0f} m from the camera and about {target_height_m:.0f} m tall; buildings or
+trees may hide its lower part.
 
-Is the {target} itself clearly visible in this image? Count it as visible only if you can see the structure,
-not merely a pole or wires that might belong to it. A clearly identifiable partial view (for example the upper
-part above trees) counts as visible. Do not count look-alikes as the {target}: utility poles, streetlights,
-flagpoles, electricity pylons, water towers or radio masts of another kind, unless that is what the {target} is.
-Disguised towers (for example a "monopine" tree or a steeple) count if you can tell the structure is the target.
+Is the {target} itself clearly visible in this image? Count it as visible only if you can see the structure
+itself, not merely something nearby that might belong to it. A clearly identifiable partial view (for example
+the upper part above trees) counts as visible. Do not count similar-looking objects of another kind as the
+{target}.{notes}
 
 Reply with: visible (true/false), confidence (0 to 1), position of the target in the frame
 (left, centre, right, or not_visible), and a one-sentence reason."""
+
+
+def prompt(context):
+    """Verifier prompt for one image. context: target, distance_m, heading, pitch, fov, target_height_m, and
+    optionally source (default "Google Street View"), target_notes (extra guidance appended to the question)
+    and target_offset_deg (for images that could not be aimed: where the target should be, + = right)."""
+    c = {'source': 'Google Street View', 'target_notes': '', **context}
+    off = c.get('target_offset_deg')
+    if off is None:
+        aim = (f"The view was aimed, using map coordinates, at a {c['target']} (compass heading {c['heading']:.0f} deg, "
+               f"pitch {c['pitch']:.0f} deg, horizontal field of view {c['fov']:.0f} deg). If the coordinates are right "
+               f"and nothing blocks the view, the {c['target']} should appear near the horizontal centre of the frame.")
+    else:
+        side = 'right' if off >= 0 else 'left'
+        aim = (f"The camera faced compass heading {c['heading']:.0f} deg (horizontal field of view about "
+               f"{c['fov']:.0f} deg). From the map coordinates, a {c['target']} should be about {abs(off):.0f} deg "
+               f"to the {side} of the image centre.")
+    notes = f" {c['target_notes'].strip()}" if str(c['target_notes'] or '').strip() else ''
+    return PROMPT.format(aim=aim, notes=notes, **{k: v for k, v in c.items() if k not in ('aim', 'notes')})
 
 
 class ClaudeVerifier:
@@ -65,7 +83,7 @@ class ClaudeVerifier:
                 output_config={'effort': self.effort, 'format': {'type': 'json_schema', 'schema': SCHEMA}},
                 messages=[{'role': 'user', 'content': [
                     {'type': 'image', 'source': {'type': 'base64', 'media_type': 'image/jpeg', 'data': data}},
-                    {'type': 'text', 'text': PROMPT.format(**context)},
+                    {'type': 'text', 'text': prompt(context)},
                 ]}],
             )
         except (a.AuthenticationError, a.PermissionDeniedError, a.NotFoundError, a.BadRequestError):
@@ -113,12 +131,29 @@ class ReviewFileVerifier:
                 'reason': r.get('reason', '')}
 
 
-def resolve(verifier):
-    """'claude' -> ClaudeVerifier(); a .csv path -> ReviewFileVerifier; None -> None; callable -> itself."""
+def auto_choice():
+    """What verifier="auto" means here: "claude" if the anthropic package is installed and ANTHROPIC_API_KEY
+    (or ANTHROPIC_AUTH_TOKEN) is set, else None (images are downloaded for review, without early stopping)."""
+    try:
+        import anthropic  # noqa: F401
+    except ImportError:
+        return None
+    return 'claude' if os.environ.get('ANTHROPIC_API_KEY') or os.environ.get('ANTHROPIC_AUTH_TOKEN') else None
+
+
+def resolve(verifier, log=None):
+    """'auto' -> see auto_choice(); 'claude' -> ClaudeVerifier(); a .csv path -> ReviewFileVerifier;
+    None -> None; callable -> itself."""
     if verifier is None or callable(verifier):
         return verifier
+    if verifier == 'auto':
+        choice = auto_choice()
+        if choice is None and log:
+            log('verifier="auto": no Claude credentials (pip install "streetsight[claude]" and set '
+                'ANTHROPIC_API_KEY), so images are downloaded for review without verification')
+        return resolve(choice)
     if verifier == 'claude':
         return ClaudeVerifier()
     if str(verifier).lower().endswith('.csv'):
         return ReviewFileVerifier(verifier)
-    raise ValueError(f'Unknown verifier {verifier!r}: use "claude", a review .csv, None, or a callable')
+    raise ValueError(f'Unknown verifier {verifier!r}: use "auto", "claude", a review .csv, None, or a callable')

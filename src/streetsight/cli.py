@@ -7,6 +7,7 @@ import argparse
 
 from .batch import find_views
 from .pipeline import find_view
+from .verify import auto_choice
 
 
 def main(argv=None):
@@ -15,17 +16,22 @@ def main(argv=None):
     p.add_argument('lon', type=float, nargs='?')
     p.add_argument('--sites', help='CSV of sites for a batch run instead of LAT LON')
     p.add_argument('--site-id', dest='site_id', help='run folder name for a single site')
-    p.add_argument('--target', default='cell tower')
+    p.add_argument('--target', default='structure', help='what to look for, e.g. "water tower"')
+    p.add_argument('--target-notes', dest='target_notes', default='', help='extra guidance for the verifier')
+    p.add_argument('--providers', default='mapillary,google',
+                   help='imagery sources tried in order (default mapillary,google)')
     p.add_argument('--target-height', type=float, dest='target_height_m')
     p.add_argument('--built-date', dest='built_date', help="target construction date, e.g. 2015 or 2015-06")
     p.add_argument('--radius', type=float, default=300, dest='radius_m')
     p.add_argument('--candidates', type=int, default=5, dest='n_candidates',
-                   help='max images to download per site (billed); 0 = rank only, free')
+                   help='max images to download per provider per site (Google images are billed); 0 = rank only')
     p.add_argument('--max-images-total', type=int, help='batch only: cap on billed images across all sites')
-    p.add_argument('--verifier', default='claude', help='claude, none, or a review CSV (image, visible, confidence, reason)')
+    p.add_argument('--verifier', default='auto', help='auto, claude, none, or a review CSV (image, visible, confidence, reason)')
     p.add_argument('--min-confidence', type=float, default=0.6)
     p.add_argument('--position-uncertainty', type=float, default=10.0, dest='position_uncertainty_m')
     p.add_argument('--out', dest='out_dir', help='run folder (single site) or parent folder (batch)')
+    p.add_argument('--min-separation', type=float, default=15.0, dest='min_separation_m',
+                   help='Mapillary: minimum distance between images downloaded for one site')
     p.add_argument('--road-spacing', type=float, default=30, dest='road_spacing_m')
     p.add_argument('--max-metadata-queries', type=int, default=60)
     p.add_argument('--search', choices=['ranked', 'exhaustive'], default='ranked',
@@ -36,9 +42,11 @@ def main(argv=None):
     p.add_argument('--no-buildings', action='store_false', dest='use_buildings')
     p.add_argument('--no-canopy', action='store_false', dest='use_canopy')
     p.add_argument('--no-terrain', action='store_false', dest='use_terrain')
-    p.add_argument('--no-fcc', action='store_false', dest='use_fcc')
+    p.add_argument('--use-fcc', action='store_true', dest='use_fcc',
+                   help='US towers: height and build date from the FCC Antenna Structure Registration')
     a = vars(p.parse_args(argv))
     a['verifier'] = None if a['verifier'] == 'none' else a['verifier']
+    a['providers'] = [s.strip() for s in a['providers'].split(',') if s.strip()]
     sites, lat, lon = a.pop('sites'), a.pop('lat'), a.pop('lon')
     resume, cap = a.pop('resume'), a.pop('max_images_total')
     if sites:
@@ -51,7 +59,8 @@ def main(argv=None):
     if lat is None or lon is None:
         p.error('give LAT LON, or --sites FILE.csv')
     result = find_view(lat, lon, **a)
-    return 0 if result.found or a['verifier'] is None else 1
+    unverified = a['verifier'] is None or (a['verifier'] == 'auto' and auto_choice() is None)
+    return 0 if result.found or unverified else 1
 
 
 if __name__ == '__main__':

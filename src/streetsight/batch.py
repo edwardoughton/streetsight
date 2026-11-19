@@ -8,9 +8,11 @@ import pandas as pd
 
 from .cache import default_runs_dir
 from .pipeline import find_view
+from .mapillary import MapillaryError
 from .streetview import StreetViewError
+from .verify import auto_choice
 
-ROW_OVERRIDES = ('target', 'target_height_m', 'built_date', 'radius_m', 'n_candidates', 'position_uncertainty_m')
+ROW_OVERRIDES = ('target', 'target_notes', 'target_height_m', 'built_date', 'radius_m', 'n_candidates', 'position_uncertainty_m')
 
 
 def _sites_table(sites):
@@ -66,9 +68,9 @@ def find_views(sites, *, out_root=None, resume=True, max_images_total=None, summ
     """Run find_view for every row of `sites` and write <out_root>/summary.csv and summary.gpkg.
 
     sites : CSV path, DataFrame or list of dicts with lat, lon and optionally site_id (also accepts
-        latitude/longitude/id). Per-row columns override keyword arguments: target, target_height_m,
-        built_date, radius_m, n_candidates, position_uncertainty_m.
-    out_root : parent folder; each site goes to <out_root>/<site_id>. Default data/streetsight_runs.
+        latitude/longitude/id). Per-row columns override keyword arguments: target, target_notes,
+        target_height_m, built_date, radius_m, n_candidates, position_uncertainty_m.
+    out_root : parent folder; each site goes to <out_root>/<site_id>. Default ./streetsight_runs (see cache.py).
     resume : skip sites whose result.json shows they were found, or already ran with at least as many
         images and the same kind of verifier.
     max_images_total : cap on billed images across the whole batch. When it is used up, remaining
@@ -76,7 +78,7 @@ def find_views(sites, *, out_root=None, resume=True, max_images_total=None, summ
     summary_name : base name of the summary files (useful when several batches share out_root).
     **kwargs : passed to find_view (verifier, n_candidates, radius_m, ...).
 
-    A Street View key or quota error stops the batch; any other per-site error is recorded and the
+    A Street View key or quota error, or a refused Mapillary token, stops the batch; any other per-site error is recorded and the
     batch continues. Returns the summary DataFrame.
     """
     df = _sites_table(sites)
@@ -91,7 +93,9 @@ def find_views(sites, *, out_root=None, resume=True, max_images_total=None, summ
             n = max(0, min(n, max_images_total - used))
         kw['n_candidates'] = n
         out_dir = out_root / sid
-        prior = (_already_done(out_dir / 'result.json', n, kw.get('verifier', 'claude'), float(kw.get('radius_m', 300)))
+        verifier = kw.get('verifier', 'auto')
+        verifier = auto_choice() if verifier == 'auto' else verifier
+        prior = (_already_done(out_dir / 'result.json', n, verifier, float(kw.get('radius_m', 300)))
                  if resume else None)
         log(f'[{i}/{len(df)}] {sid} ({site["lat"]:.6f}, {site["lon"]:.6f})' + (' - already done' if prior else ''))
         if prior:
@@ -102,7 +106,7 @@ def find_views(sites, *, out_root=None, resume=True, max_images_total=None, summ
             summary = json.loads((out_dir / 'result.json').read_text(encoding='utf-8'))
             used += summary.get('n_image_requests', 0)
             rows.append(_summary_row(sid, summary, out_root))
-        except StreetViewError as exc:
+        except (StreetViewError, MapillaryError) as exc:
             rows.append({'site_id': sid, 'lat': site['lat'], 'lon': site['lon'], 'error': str(exc)})
             log(f'Stopping batch: {exc}')
             break

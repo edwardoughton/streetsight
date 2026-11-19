@@ -1,19 +1,31 @@
 """Where streetsight keeps downloads and runs.
 
-Data root: STREETSIGHT_DATA, else ./data (the project's git-ignored data folder).
-Cache: STREETSIGHT_CACHE, else <data root>/cache. Runs: <data root>/streetsight_runs.
+Cache (Overture, canopy, FCC downloads): STREETSIGHT_CACHE, else the per-user cache folder
+(e.g. ~/.cache/streetsight on Linux, %LOCALAPPDATA%\\streetsight\\Cache on Windows).
+Runs: STREETSIGHT_RUNS, else ./streetsight_runs in the current folder.
+
+STREETSIGHT_DATA=<folder> keeps both in one project folder instead: <folder>/cache and
+<folder>/streetsight_runs (the layout used before version 0.3).
 """
 import os
 from pathlib import Path
 
+import platformdirs
 
-def data_dir():
-    return Path(os.environ.get('STREETSIGHT_DATA') or 'data')
+
+def _data_dir():
+    return Path(os.environ['STREETSIGHT_DATA']) if os.environ.get('STREETSIGHT_DATA') else None
 
 
 def default_cache_dir():
-    return Path(os.environ['STREETSIGHT_CACHE']) if os.environ.get('STREETSIGHT_CACHE') else data_dir() / 'cache'
+    if os.environ.get('STREETSIGHT_CACHE'):
+        return Path(os.environ['STREETSIGHT_CACHE'])
+    data = _data_dir()
+    return data / 'cache' if data else Path(platformdirs.user_cache_dir('streetsight', appauthor=False))
 
 
 def default_runs_dir():
-    return data_dir() / 'streetsight_runs'
+    if os.environ.get('STREETSIGHT_RUNS'):
+        return Path(os.environ['STREETSIGHT_RUNS'])
+    data = _data_dir()
+    return data / 'streetsight_runs' if data else Path('streetsight_runs')
