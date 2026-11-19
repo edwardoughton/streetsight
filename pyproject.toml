@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "streetsight"
 dynamic = ["version"]
-description = "Find a street-level image (Mapillary, then Google Street View) that shows a tall structure, using line of sight past buildings, trees and terrain"
+description = "Find a street-level image (Mapillary, then Google Street View) of a tall structure anywhere in the world, using line of sight past buildings, trees and terrain"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"

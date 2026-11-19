@@ -193,7 +193,7 @@ class PipelineTests(unittest.TestCase):
                 mock.patch.object(pipeline.overture, 'roads', return_value=roads), \
                 mock.patch.object(pipeline.overture, 'buildings', return_value=bld):
             return pipeline.find_view(*TOWER, target_height_m=40, radius_m=150, verifier=verifier,
-                                      out_dir=Path(self.tmp.name) / 'run', use_canopy=False, use_fcc=False,
+                                      out_dir=Path(self.tmp.name) / 'run', use_canopy=False, use_ghs_heights=False,
                                       use_terrain=False, log=lambda *_: None, **{'providers': ['google'], **kw})
 
     def test_ranks_clear_view_first_and_stops_when_verified(self):
@@ -228,7 +228,7 @@ class PipelineTests(unittest.TestCase):
             with mock.patch.object(pipeline.overture, 'roads', return_value=roads),                     mock.patch.object(pipeline.overture, 'buildings', return_value=None):
                 second = pipeline.find_view(*TOWER, target_height_m=40, radius_m=150, n_candidates=2,
                                             verifier=ReviewFileVerifier(review), out_dir=out, use_canopy=False,
-                                            use_fcc=False, use_terrain=False, log=lambda *_: None,
+                                            use_ghs_heights=False, use_terrain=False, log=lambda *_: None,
                                             providers=['google'])
         statics = [r for r in __import__('json').loads((out / 'result.json').read_text())['attempts']]
         self.assertEqual([a['verified_visible'] for a in statics], [False, None])

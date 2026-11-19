@@ -4,6 +4,8 @@ Give it the coordinates and height of a tall structure; it finds a street-level 
 
 streetsight downloads the buildings, trees, terrain and roads around the target and checks every candidate camera position for line of sight before downloading anything. It tries free [Mapillary](https://www.mapillary.com/) imagery first and falls back to Google Street View. Images are fetched best-first until a verifier (Claude, a review file, or your own function) confirms the target is visible.
 
+It works anywhere in the world: every data source is global, read remotely a window at a time, and needs no account. The US gets higher-resolution terrain where it is available.
+
 ```python
 import streetsight
 
@@ -40,15 +42,21 @@ A provider without credentials is skipped with a message. On Windows, variables 
 
 ## What one call does
 
-1. **Target height.** `target_height_m=` if given. With `use_fcc=True` (US towers), the nearest constructed FCC Antenna Structure Registration within 100 m. Otherwise 30 m is assumed.
+1. **Target height.** `target_height_m=` if given, else 30 m. Look the height up yourself (for example from a national tower register) and pass it in, with `built_date` if you know it.
 2. **Clutter and roads**, downloaded in parallel for the search area:
-   - Overture buildings (which include OpenStreetMap buildings), using Overture's height, else floors × 3 m, else 5 m
-   - Overture road segments
-   - Meta/WRI 1 m canopy height
-   - USGS 3DEP 10 m bare-earth elevation (US only; elsewhere the ground is treated as flat)
+
+   | Layer | Source | Resolution | Coverage |
+   |---|---|---|---|
+   | Building footprints | Overture buildings (OpenStreetMap, Microsoft and Google footprints, and others) | per building | global |
+   | Building heights | Overture `height`, else `num_floors` × 3 m, else the GHS-BUILT-H average building height of the surrounding 100 m cell, else 5 m | per building / 100 m | global |
+   | Trees | Meta/WRI canopy height | 1 m | global |
+   | Terrain (bare earth) | USGS 3DEP where available, else GEDTM30 | 10 m / 30 m | US / global except Antarctica |
+   | Roads | Overture transportation segments | per segment | global |
+
+   Each run records which sources it used (`terrain`, `building_height_sources` in `result.json`).
 3. **Line of sight.** For each camera position, streetsight computes how high up the target the view clears buildings, trees and the ground. Heights are measured from the ground at the target's base, so cameras above or below the target are handled. The score combines the visible part with distance. It is a ranking heuristic between 0 and 1, not a calibrated probability. Images taken before the target's `built_date` are down-weighted to a tenth.
 4. **Providers, in order** (`providers=("mapillary", "google")`):
-   - **Mapillary.** One search returns every image within `radius_m`. 360° panoramas are kept and cropped locally to a view aimed at the target. Ordinary photos are kept only if the target lies within their field of view; they are used as taken, and the verifier is told where in the frame to look. The best-scoring images are downloaded, at least `min_separation_m` apart, because consecutive frames of one sequence share the same obstructions.
+   - **Mapillary.** One search returns every image within `radius_m`. 360° panoramas are kept and cropped locally to a view aimed at the target. Ordinary photos are kept only if the target lies within their horizontal field of view and its unobstructed part reaches into their vertical one; they are used as taken, and the verifier is told where in the frame to look. The best-scoring images are downloaded, at least `min_separation_m` apart, because consecutive frames of one sequence share the same obstructions.
    - **Google Street View**, only if Mapillary gave no confirmed image. Points are sampled every `road_spacing_m` along roads, scored locally, and Street View metadata is queried at the best points first (`search="ranked"`). The search stops at `target_panoramas` panoramas, after 16 queries in a row that found nothing new, or at `max_metadata_queries`. Metadata requests are free but count against quota; image requests are billed.
 5. **Download and verify.** Images are aimed at the target, with pitch and field of view chosen so the visible part fits in the frame. Close views are widened to allow for `position_uncertainty_m` of error in the target coordinates. The run stops at the first image the verifier confirms with confidence of at least `min_confidence`, or after `n_candidates` images per provider.
 
@@ -56,7 +64,7 @@ A provider without credentials is skipped with a message. On Windows, variables 
 
 | Parameter | Default | Meaning |
 |---|---|---|
-| `target_height_m` | FCC if `use_fcc`, else 30 | Target height above ground |
+| `target_height_m` | 30 | Target height above ground |
 | `target` | `"structure"` | What to look for, used in the verifier prompt |
 | `target_notes` | `""` | Extra verifier guidance, e.g. which look-alikes to reject |
 | `providers` | `("mapillary", "google")` | Imagery sources, tried in order |
@@ -65,7 +73,7 @@ A provider without credentials is skipped with a message. On Windows, variables 
 | `n_candidates` | 5 | Most images downloaded per provider; 0 = rank only |
 | `verifier` | `"auto"` | `"auto"` (Claude if `ANTHROPIC_API_KEY` is set, else none), `"claude"`, `None`, a review CSV, or a callable |
 | `min_confidence` | 0.6 | Verifier confidence needed to stop |
-| `built_date` | FCC date if `use_fcc` | Images taken before this are down-weighted |
+| `built_date` | none | Construction date, if known; images taken before it are down-weighted |
 | `position_uncertainty_m` | 10 | Possible error in the target coordinates; widens close views |
 | `min_separation_m` | 15 | Mapillary: minimum distance between downloaded images |
 | `road_spacing_m` | 30 | Google: spacing of candidate points along roads |
@@ -73,9 +81,10 @@ A provider without credentials is skipped with a message. On Windows, variables 
 | `target_panoramas` | max(10, 2 × `n_candidates`) | Google: ranked search stops after this many panoramas |
 | `max_metadata_queries` | 60 | Google: cap on metadata requests per site |
 | `use_buildings`, `use_canopy`, `use_terrain` | True | Turn individual data sources off |
-| `use_fcc` | False | Look up height and construction date in the FCC registry (US towers) |
+| `terrain_source` | `"auto"` | `"auto"` (3DEP in the US, else GEDTM30), `"3dep"` or `"gedtm30"` |
+| `use_ghs_heights` | True | Fill missing building heights from GHS-BUILT-H |
 | `out_dir` | `./streetsight_runs/<site_id>` | Run folder |
-| `cache_dir` | per-user cache folder | Downloaded Overture, canopy and FCC data |
+| `cache_dir` | per-user cache folder | Downloaded Overture data |
 
 ### Verifiers
 
@@ -91,7 +100,7 @@ Images missing from the CSV, or marked `unclear`, count as unconfirmed.
 For targets with common look-alikes, add guidance, for example for cell towers:
 
 ```python
-find_view(lat, lon, target="cell tower", use_fcc=True,
+find_view(lat, lon, target="cell tower", target_height_m=45,
           target_notes="Do not count utility poles, streetlights, flagpoles or electricity pylons. "
                        "Disguised towers (a 'monopine' tree, a steeple) count if the structure is identifiable.")
 ```
@@ -125,20 +134,23 @@ Re-running a batch skips sites already found, and sites that already ran with at
 ## Limits
 
 - **Mapillary orientation:** panoramas are cropped assuming their middle column faces Mapillary's computed compass angle. User-contributed imagery can be mis-oriented or blurry, so a crop may miss the target even with a clear line of sight.
-- **Terrain:** the 10 m elevation model smooths narrow features such as embankments and cuttings, and the 20 m nearest each end of the sight line is ignored. Outside the US the ground is treated as flat.
+- **Terrain:** the 10 m (US) and 30 m (global) elevation models smooth narrow features such as embankments and cuttings, and the 20 m nearest each end of the sight line is ignored.
+- **Building heights:** outside North America and Europe most buildings have no Overture height or floor count, and get the GHS-BUILT-H average for their 100 m cell (2018). A tall building in a low-rise cell is under-estimated, and new buildings are missed.
 - **Trees:** canopy is treated as opaque, and its effect is discounted in the score. The canopy data comes from roughly 2018–2020 imagery and under-estimates tall single trees, especially street trees beside the camera.
+- **Other clutter** (walls, noise barriers, bridges, signs, vehicles) is not modelled.
+- **Mapillary photo quality** varies; blurred or badly oriented photos are only caught by the verifier.
 - **Dates:** only the image month is compared with the construction date; demolition and replacement are not checked.
 - **Google coverage:** the metadata API returns only the nearest panorama to each sample point, so rarely used side roads may be missed.
-- **FCC registrations** do not prove cellular use, and many shorter towers are not registered.
 
 ## Data, licences and terms
 
 | Source | Licence or terms |
 |---|---|
 | Overture buildings and transportation | ODbL and other open licences; see the Overture attribution guidance |
-| Meta/WRI canopy height | CC BY 4.0 |
+| Meta/WRI canopy height (Tolan et al. 2024) | CC BY 4.0 |
+| GHS-BUILT-H R2023A, European Commission JRC | CC BY 4.0 |
+| GEDTM30 v1.2, OpenGeoHub (Ho et al. 2025) | CC BY 4.0 |
 | USGS 3DEP elevation | US public domain |
-| FCC ASR | US public data |
 | Mapillary imagery | CC BY-SA 4.0; credit Mapillary and the contributor (recorded in `copyright`) |
 | Google Street View | Google Maps Platform Terms |
 

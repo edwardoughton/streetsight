@@ -12,12 +12,12 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
-from . import canopy, fcc, overture, terrain
+from . import canopy, ghsl, overture, terrain
 from .cache import default_cache_dir, default_runs_dir
 from .candidates import discover, discover_ranked, road_sample_points
 from .export import write_outputs
 from .geometry import bbox_around, bearing_distance, framing
-from .mapillary import MapillaryClient, MapillaryError
+from .mapillary import MapillaryClient, MapillaryError, in_vertical_view
 from .streetview import StreetViewClient, StreetViewError
 from .verify import resolve
 from .visibility import building_los, canopy_los, combine, ground_offsets, score, terrain_los
@@ -97,28 +97,39 @@ class FindViewResult:
 
 
 def load_layers(lat, lon, radius_m, out_dir, cache_dir, use_buildings=True, use_canopy=True, use_terrain=True,
-                log=print):
+                log=print, terrain_source='auto', use_ghs_heights=True):
     """Fetch buildings, roads, canopy and terrain for the search area (in parallel).
+
+    terrain_source : "auto" (USGS 3DEP in the US, else global GEDTM30), "3dep" or "gedtm30".
+    use_ghs_heights : buildings with no Overture height or floor count get the GHS-BUILT-H 100 m average.
 
     Returns a dict: buildings, roads, height_tif (Meta canopy height), ground sampler, z_t (target ground
     elevation), and info about the sources used.
     """
     out_dir = Path(out_dir)
     bbox = bbox_around(lat, lon, radius_m + 50)
-    with ThreadPoolExecutor(4) as ex:
+    with ThreadPoolExecutor(5) as ex:
         f_b = ex.submit(overture.buildings, bbox, cache_dir, log=log) if use_buildings else None
+        f_g = ex.submit(ghsl.read_window, bbox, log=log) if use_buildings and use_ghs_heights else None
         f_r = ex.submit(overture.roads, bbox, cache_dir, log=log)
         f_c = ex.submit(canopy.fetch, bbox, out_dir / 'canopy_height.tif', log=log) if use_canopy else None
-        f_t = ex.submit(terrain.fetch, bbox, out_dir / 'terrain.tif', log=log) if use_terrain else None
+        f_t = (ex.submit(terrain.fetch, bbox, out_dir / 'terrain.tif', source=terrain_source, log=log)
+               if use_terrain else None)
         buildings = f_b.result() if f_b else None
         roads = f_r.result()
         canopy_tif = f_c.result() if f_c else None
-        terrain_tif = f_t.result() if f_t else None
+        terrain_tif, terrain_name = f_t.result() if f_t else (None, None)
+        ghs = f_g.result() if f_g else None
+    if ghs is not None:
+        buildings = ghsl.fill_heights(buildings, bbox, window=ghs, log=log)
     ground = terrain.Ground(terrain_tif) if terrain_tif else None
     z_t = float(ground([lon], [lat])[0]) if ground else math.nan
+    heights = (buildings['height_source'].value_counts().to_dict()
+               if buildings is not None and len(buildings) else {})
     return {'buildings': buildings, 'roads': roads, 'height_tif': canopy_tif, 'ground': ground, 'z_t': z_t,
             'info': {'canopy': 'meta_wri_1m' if canopy_tif else 'none',
-                     'terrain': 'usgs_3dep_13' if ground else 'flat'}}
+                     'terrain': terrain_name if ground else 'flat',
+                     'building_height_sources': heights}}
 
 
 def _google_candidates(client, roads, los, lat, lon, radius_m, n_candidates, search, road_spacing_m,
@@ -162,7 +173,7 @@ def find_view(lat, lon, *, target_height_m=None, target='structure', target_note
               google_api_key=None, mapillary_token=None, road_spacing_m=30, search='ranked', target_panoramas=None,
               max_metadata_queries=60, max_sample_points=1500, camera_height_m=2.5, position_uncertainty_m=10.0,
               min_separation_m=15.0, built_date=None, use_buildings=True, use_canopy=True, use_terrain=True,
-              use_fcc=False, cache_dir=None, log=print):
+              terrain_source='auto', use_ghs_heights=True, cache_dir=None, log=print):
     """Find a street-level image that shows the target at (lat, lon).
 
     For each provider in turn, camera positions are ranked by line of sight to the target, then images are
@@ -171,8 +182,7 @@ def find_view(lat, lon, *, target_height_m=None, target='structure', target_note
     Parameters
     ----------
     lat, lon : target location (WGS84).
-    target_height_m : height above ground. Default: the nearest constructed FCC Antenna Structure
-        Registration within 100 m if use_fcc (US only), else 30 m.
+    target_height_m : height above ground (default 30 m).
     target : short description used in the verifier prompt, e.g. "water tower", "cell tower".
     target_notes : extra guidance for the verifier, e.g. what look-alikes to reject.
     providers : imagery sources, tried in order: "mapillary" (free, needs MAPILLARY_ACCESS_TOKEN) and
@@ -200,11 +210,12 @@ def find_view(lat, lon, *, target_height_m=None, target='structure', target_note
     position_uncertainty_m : how far the true target may be from (lat, lon); close views are widened to
         keep it in frame.
     min_separation_m : Mapillary only: images downloaded for one site are at least this far apart.
-    built_date : construction date of the target ('YYYY', 'YYYY-MM' or 'MM/DD/YYYY'). Default: the FCC
-        record's construction date, if use_fcc. Images taken earlier are down-weighted.
+    built_date : construction date of the target ('YYYY', 'YYYY-MM' or 'MM/DD/YYYY'), if known. Images
+        taken earlier are down-weighted.
     use_buildings, use_canopy, use_terrain : switch clutter and terrain sources off.
-    use_fcc : look up height and construction date in the FCC Antenna Structure Registration (US towers).
-    cache_dir : download cache for Overture, canopy and FCC (default per-user cache folder).
+    terrain_source : "auto" (USGS 3DEP 10 m in the US, else global GEDTM30 30 m), "3dep" or "gedtm30".
+    use_ghs_heights : fill missing Overture building heights from GHS-BUILT-H (100 m average, global).
+    cache_dir : download cache for Overture (default per-user cache folder).
 
     Returns FindViewResult; everything is also written to out_dir (see export.write_outputs).
     """
@@ -234,19 +245,14 @@ def find_view(lat, lon, *, target_height_m=None, target='structure', target_note
     # 1. Target height.
     tgt = {'site_id': site_id, 'lat': lat, 'lon': lon, 'target': target, 'height_m': target_height_m,
            'height_source': 'user' if target_height_m else None, 'built_date': built_date}
-    if target_height_m is None and use_fcc:
-        h, m = fcc.tower_height(fcc.load_asr(cache_dir, log=log), lat, lon)
-        if h:
-            tgt.update(height_m=h, height_source='fcc_asr_overall_agl', fcc_registration=m['registration'],
-                       fcc_distance_m=m['distance_m'], fcc_constructed=m['constructed_date'])
-            tgt['built_date'] = built_date or m['constructed_date'] or None
     if tgt['height_m'] is None:
         tgt.update(height_m=DEFAULT_TARGET_HEIGHT_M, height_source='assumed_default')
     H = float(tgt['height_m'])
     log(f"Target height {H} m ({tgt['height_source']})")
 
     # 2. Clutter, roads and terrain, fetched in parallel.
-    L = load_layers(lat, lon, radius_m, out_dir, cache_dir, use_buildings, use_canopy, use_terrain, log)
+    L = load_layers(lat, lon, radius_m, out_dir, cache_dir, use_buildings, use_canopy, use_terrain, log,
+                    terrain_source=terrain_source, use_ghs_heights=use_ghs_heights)
     buildings, roads, canopy_tif, ground, z_t = L['buildings'], L['roads'], L['height_tif'], L['ground'], L['z_t']
     tgt['ground_elevation_m'] = None if math.isnan(z_t) else round(z_t, 1)
     tgt.update(L['info'])
@@ -277,6 +283,11 @@ def find_view(lat, lon, *, target_height_m=None, target='structure', target_note
                 f'({sum(p["is_pano"] for p in panos)} panoramas)')
             sep = min_separation_m
         assess(panos, **los)
+        if name == 'mapillary':
+            n0 = len(panos)
+            panos = [p for p in panos if in_vertical_view(p, camera_height_m)]
+            if len(panos) < n0:
+                log(f'Mapillary: dropped {n0 - len(panos)} photos whose frame is below the visible part of the target')
         panos.sort(key=lambda p: -p['score'])
         for i, p in enumerate(panos, 1):
             p['rank'] = i
@@ -292,7 +303,8 @@ def find_view(lat, lon, *, target_height_m=None, target='structure', target_note
               'search': search, 'max_metadata_queries': max_metadata_queries, 'road_spacing_m': road_spacing_m,
               **sampling, 'min_separation_m': min_separation_m, 'camera_height_m': camera_height_m,
               'position_uncertainty_m': position_uncertainty_m, 'use_buildings': use_buildings,
-              'use_canopy': use_canopy, 'use_terrain': use_terrain, **L['info'], 'use_fcc': use_fcc,
+              'use_canopy': use_canopy, 'use_terrain': use_terrain, 'terrain_source': terrain_source,
+              'use_ghs_heights': use_ghs_heights, **L['info'],
               'verifier': getattr(check, 'model', None) or (None if check is None else 'custom')}
     request_log = [row for c in clients.values() for row in c.log]
     write_outputs(result, params, sample_records, buildings, roads, request_log)

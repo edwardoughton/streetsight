@@ -132,7 +132,21 @@ def to_view(dist, bearing, im, edge_margin=0.8):
     off = (bearing - float(compass) + 180) % 360 - 180
     if abs(off) > edge_margin * fov / 2:
         return None
-    return {**v, 'camera_fov': fov, 'target_offset_deg': round(off, 1)}
+    w, h = im.get('width'), im.get('height')
+    aspect = h / w if w and h else 0.75
+    vfov = math.degrees(2 * math.atan(math.tan(math.radians(fov) / 2) * aspect))
+    return {**v, 'camera_fov': fov, 'camera_vfov': round(vfov, 1), 'target_offset_deg': round(off, 1)}
+
+
+def in_vertical_view(view, camera_h, edge_margin=0.9):
+    """For a level perspective photo: does the unobstructed part of the target (from visible_above_m up to its
+    top, after line of sight) reach into the frame? Panoramas are always True (they are cropped to fit)."""
+    if view.get('is_pano') or view.get('camera_vfov') is None:
+        return True
+    d = max(view['distance_m'], 1.0)
+    cam = camera_h + view.get('ground_offset_m', 0.0)
+    bottom = math.degrees(math.atan2(view.get('visible_above_m', 0.0) - cam, d))
+    return bottom < edge_margin * view['camera_vfov'] / 2
 
 
 def perspective_from_equirect(pano, centre_heading, heading, pitch, fov, size=640):

@@ -1,8 +1,12 @@
-"""Bare-earth ground elevation from USGS 3DEP 1/3 arc-second (~10 m) DEM, public COGs.
+"""Bare-earth ground elevation, read remotely from public cloud-optimised GeoTIFFs (only the window needed).
 
-Tiles are 1 x 1 degree, named by their north-west corner (n42w089 covers 41-42 N, 88-89 W).
-Only the clipped window is downloaded. Coverage is the US and territories; outside it, fetch()
-returns None and the pipeline falls back to flat ground. Public domain (USGS).
+- USGS 3DEP 1/3 arc-second (~10 m), US and territories, public domain. Tiles are 1 x 1 degree, named by
+  their north-west corner (n42w089 covers 41-42 N, 88-89 W).
+- GEDTM30 v1.2 (OpenGeoHub, Ho et al. 2025), 30 m global ensemble digital terrain model, CC BY 4.0: one
+  global file, used wherever 3DEP has no tile. Antarctica is not covered.
+
+source="auto" (default) uses 3DEP where available, else GEDTM30. If neither has data, fetch() returns None
+and the pipeline treats the ground as flat.
 """
 import math
 import time
@@ -11,6 +15,9 @@ from pathlib import Path
 import numpy as np
 
 URL = 'https://prd-tnm.s3.amazonaws.com/StagedProducts/Elevation/13/TIFF/current/{t}/USGS_13_{t}.tif'
+GEDTM30_URL = ('https://s3.opengeohub.org/global/dtm/v1.2/'
+               'gedtm_rf_m_30m_s_20060101_20151231_go_epsg.4326.3855_v1.2.tif')
+SOURCES = {'3dep': 'usgs_3dep_13', 'gedtm30': 'gedtm30_v1.2'}
 
 
 def tile_name(lat, lon):
@@ -21,16 +28,65 @@ def tile_name(lat, lon):
     return ns + ew
 
 
-def fetch(bbox, out_tif, log=print):
-    """Clip the DEM to bbox=(west, south, east, north) and write out_tif (EPSG:4269, float32 metres).
+def fetch(bbox, out_tif, source='auto', log=print):
+    """Clip a DEM to bbox=(west, south, east, north) and write out_tif (float32 metres).
 
-    Returns out_tif, or None if no 3DEP tile covers the area.
+    source : "auto" (3DEP, else GEDTM30), "3dep" or "gedtm30".
+    Returns (out_tif, source name) or (None, None) if no elevation data covers the area.
     """
+    if source not in ('auto', '3dep', 'gedtm30'):
+        raise ValueError(f'terrain source must be "auto", "3dep" or "gedtm30", not {source!r}')
+    out_tif = Path(out_tif)
+    used = out_tif.with_suffix('.source.txt')
+    if out_tif.is_file() and used.is_file():
+        return out_tif, used.read_text().strip()
+    got = fetch_3dep(bbox, out_tif, log) if source in ('auto', '3dep') else None
+    name = SOURCES['3dep'] if got else None
+    if got is None and source in ('auto', 'gedtm30'):
+        got = fetch_gedtm30(bbox, out_tif, log)
+        name = SOURCES['gedtm30'] if got else None
+    if got:
+        used.write_text(name)
+    return got, name
+
+
+def fetch_gedtm30(bbox, out_tif, log=print):
+    """Clip GEDTM30 to bbox and write out_tif (EPSG:4326, float32 metres); None if no data there."""
+    import rasterio
+    from rasterio.windows import from_bounds
+    out_tif = Path(out_tif)
+    west, south, east, north = bbox
+    t = time.time()
+    with rasterio.Env(GDAL_DISABLE_READDIR_ON_OPEN='EMPTY_DIR', GDAL_HTTP_MAX_RETRY='3'):
+        try:
+            with rasterio.open('/vsicurl/' + GEDTM30_URL) as ds:
+                win = from_bounds(west, south, east, north, ds.transform).round_offsets().round_lengths()
+                arr = ds.read(1, window=win, boundless=True, fill_value=-999999.0).astype('float32')
+                tr, crs, nodata = ds.window_transform(win), ds.crs, ds.nodata
+        except rasterio.errors.RasterioIOError as exc:
+            log(f'Terrain: GEDTM30 unavailable ({exc})')
+            return None
+    if nodata is not None:
+        arr[arr == nodata] = -999999.0
+    arr[~np.isfinite(arr) | (arr > 1e5)] = -999999.0
+    valid = arr[arr > -1e5]
+    if not valid.size:
+        log('Terrain: GEDTM30 has no data here')
+        return None
+    out_tif.parent.mkdir(parents=True, exist_ok=True)
+    with rasterio.open(out_tif, 'w', driver='GTiff', dtype='float32', count=1, crs=crs, transform=tr,
+                       height=arr.shape[0], width=arr.shape[1], nodata=-999999.0, compress='deflate') as dst:
+        dst.write(arr, 1)
+    log(f'Terrain: GEDTM30, {arr.shape[1]}x{arr.shape[0]} px, {valid.min():.0f}-{valid.max():.0f} m '
+        f'in {time.time() - t:.0f}s')
+    return out_tif
+
+
+def fetch_3dep(bbox, out_tif, log=print):
+    """Clip USGS 3DEP to bbox and write out_tif (EPSG:4269, float32 metres); None if no 3DEP tile covers it."""
     import rasterio
     from rasterio.merge import merge
     out_tif = Path(out_tif)
-    if out_tif.is_file():
-        return out_tif
     west, south, east, north = bbox
     names = sorted({tile_name(y, x) for x in (west, east) for y in (south, north)})
     t = time.time()

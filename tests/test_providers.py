@@ -12,7 +12,8 @@ from shapely.geometry import LineString
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 from streetsight import cache, pipeline, verify  # noqa: E402
-from streetsight.mapillary import MapillaryError, perspective_fov, perspective_from_equirect, to_view  # noqa: E402
+from streetsight.mapillary import (MapillaryError, in_vertical_view, perspective_fov,  # noqa: E402
+                                   perspective_from_equirect, to_view)
 
 TOWER = (41.0, -88.0)
 M = 111_320
@@ -41,6 +42,15 @@ class MapillaryViewTests(unittest.TestCase):
     def test_perspective_photo_facing_away_is_dropped(self):
         self.assertIsNone(to_view(50, 0.0, mly_image(3, 50, compass=180, pano=False)))
         self.assertIsNone(to_view(50, 0.0, {**mly_image(4, 50, pano=False), 'computed_compass_angle': None}))
+
+    def test_vertical_check_for_level_photos(self):
+        v = to_view(50, 0.0, mly_image(5, 50, compass=0, pano=False, params=[0.5], w=400, h=300))
+        self.assertAlmostEqual(v['camera_vfov'], 73.7, delta=0.1)  # hfov 90, 4:3
+        clear = {**v, 'visible_above_m': 0.0}
+        high = {**v, 'visible_above_m': 80.0}  # only the part above 80 m is unobstructed: 58 deg up at 50 m
+        self.assertTrue(in_vertical_view(clear, 2.5))
+        self.assertFalse(in_vertical_view(high, 2.5))
+        self.assertTrue(in_vertical_view({**high, 'is_pano': True}, 2.5))
 
     def test_fov_from_normalised_focal(self):
         self.assertAlmostEqual(perspective_fov({'camera_parameters': [0.5], 'width': 400, 'height': 300}), 90.0)
@@ -119,7 +129,7 @@ class ProviderOrderTests(unittest.TestCase):
                 mock.patch.object(pipeline.overture, 'roads', return_value=roads), \
                 mock.patch.object(pipeline.overture, 'buildings', return_value=None):
             return pipeline.find_view(*TOWER, target_height_m=40, radius_m=150, verifier=verifier,
-                                      out_dir=Path(self.tmp.name) / 'run', use_canopy=False, use_terrain=False,
+                                      out_dir=Path(self.tmp.name) / 'run', use_canopy=False, use_terrain=False, use_ghs_heights=False,
                                       log=lambda *_: None, **kw)
 
     def test_mapillary_success_never_touches_google(self):

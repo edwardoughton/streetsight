@@ -1,6 +1,6 @@
 """Where streetsight keeps downloads and runs.
 
-Cache (Overture, canopy, FCC downloads): STREETSIGHT_CACHE, else the per-user cache folder
+Cache (Overture downloads): STREETSIGHT_CACHE, else the per-user cache folder
 (e.g. ~/.cache/streetsight on Linux, %LOCALAPPDATA%\\streetsight\\Cache on Windows).
 Runs: STREETSIGHT_RUNS, else ./streetsight_runs in the current folder.
 

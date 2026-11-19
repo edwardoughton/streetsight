@@ -10,8 +10,9 @@ from .pipeline import find_view
 from .verify import auto_choice
 
 
-def main(argv=None):
-    p = argparse.ArgumentParser(prog='streetsight', description=find_view.__doc__.split('\n')[0])
+def build_parser(prog='streetsight'):
+    """The command-line parser, for wrappers that add their own defaults or options."""
+    p = argparse.ArgumentParser(prog=prog, description=find_view.__doc__.split('\n')[0])
     p.add_argument('lat', type=float, nargs='?')
     p.add_argument('lon', type=float, nargs='?')
     p.add_argument('--sites', help='CSV of sites for a batch run instead of LAT LON')
@@ -42,8 +43,15 @@ def main(argv=None):
     p.add_argument('--no-buildings', action='store_false', dest='use_buildings')
     p.add_argument('--no-canopy', action='store_false', dest='use_canopy')
     p.add_argument('--no-terrain', action='store_false', dest='use_terrain')
-    p.add_argument('--use-fcc', action='store_true', dest='use_fcc',
-                   help='US towers: height and build date from the FCC Antenna Structure Registration')
+    p.add_argument('--terrain-source', choices=['auto', '3dep', 'gedtm30'], default='auto',
+                   help='auto: USGS 3DEP in the US, else global GEDTM30')
+    p.add_argument('--no-ghs-heights', action='store_false', dest='use_ghs_heights',
+                   help='do not fill missing building heights from GHS-BUILT-H')
+    return p
+
+
+def main(argv=None, parser=None):
+    p = parser or build_parser()
     a = vars(p.parse_args(argv))
     a['verifier'] = None if a['verifier'] == 'none' else a['verifier']
     a['providers'] = [s.strip() for s in a['providers'].split(',') if s.strip()]
