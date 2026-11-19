@@ -1,10 +1,12 @@
 # streetsight
 
-Give it the coordinates and height of a tall structure; it downloads the street-level images most likely to show it.
+Wouldn't it be nice to have an actual street image of something you're interested in? 
 
-streetsight looks at the buildings, trees, terrain and roads around the target and works out, for every available camera position, how much of the target should be visible from there. It then downloads the best views, aimed at the target: from free [Mapillary](https://www.mapillary.com/) imagery first, and from Google Street View only for what Mapillary cannot supply.
+The aim of streetsight is to help us optimize the probability of getting a low cost image for a target of interest, accounting for image availability and line-of-sight blockages (from buildings, trees, etc.). 
 
-It works anywhere in the world: every data source is global, read remotely a small window at a time, and needs no account. The US gets higher-resolution terrain.
+Simply give streetsight your target coordinates and it downloads street images most likely to show it. You can also provide an expected height for your target. I built this package (with a little help from Claude) to preference using free [Mapillary](https://www.mapillary.com/) imagery first, and if this isn't available, it can use Google Street View as a backup option.
+
+You can use streetsight anywhere in the world, as every data source is global, read remotely a small window at a time, and needs no account (except for your Mapillary/Streetview API keys). For now, I do use a higher resolution terrain model for the USA.
 
 ```python
 import streetsight
@@ -23,7 +25,7 @@ From a terminal:
 - Mapillary only (no Google costs): add `--providers mapillary`
 - rank camera positions without downloading: add `--images 0`
 
-streetsight predicts what each camera can see; it does not look at the images. A view it ranks highly can still miss the target if the map data is out of date or the target's coordinates are off.
+streetsight predicts what each camera can see, without looking at the images. The only caveat is that a view it ranks highly can still miss the target if the map data is out of date or the target's coordinates are off.
 
 ## Install
 
@@ -35,8 +37,8 @@ Credentials are read from environment variables:
 
 | Variable | Needed for |
 |---|---|
-| `MAPILLARY_ACCESS_TOKEN` | Mapillary (free; create a client token at mapillary.com/dashboard/developers) |
-| `GOOGLE_MAPS_API_KEY` | Google Street View (Street View Static API enabled; images are billed) |
+| `MAPILLARY_ACCESS_TOKEN` | Mapillary (free, just create a client token at mapillary.com/dashboard/developers) |
+| `GOOGLE_MAPS_API_KEY` | Google Street View (Street View Static API enabled, images are billed beyond ~5k/month) |
 
 A provider without credentials is skipped with a message. On Windows, a Mapillary token set with `[Environment]::SetEnvironmentVariable(..., 'User')` is picked up even in shells opened before it was set.
 
@@ -52,9 +54,9 @@ A provider without credentials is skipped with a message. On Windows, a Mapillar
    | Terrain (bare earth) | USGS 3DEP where available, else GEDTM30 | 10 m / 30 m | US / global except Antarctica |
    | Roads | Overture transportation segments | per segment | global |
 
-2. **Line of sight.** For each camera position, streetsight computes how high up the target the view clears buildings, trees and the ground, giving the fraction of the target predicted visible. Heights are measured from the ground at the target's base, so cameras above or below the target are handled. A score combines visibility with distance (closer is better, scaled to the target's height) and ranks the views. Images taken before the target's `built_date`, if given, are down-weighted.
-3. **Mapillary.** One search returns every image within `radius_m`. 360° panoramas are cropped locally to a view aimed at the target. Ordinary photos are kept only if the target lies inside their field of view; they are used as taken, and `target_offset_deg` records where in the frame the target should be. The best views with at least `min_visible_fraction` of the target predicted visible are downloaded, at least `min_separation_m` apart, because neighbouring frames of one sequence share the same obstructions.
-4. **Google Street View**, only if Mapillary supplied fewer than `n_images`. Points are sampled every `road_spacing_m` along roads and scored locally first; Street View metadata is then queried at the best points only (`search="ranked"`), which is free but counts against quota. The best panoramas fill the remaining places; each image is billed.
+2. **Line of sight.** For each camera position, streetsight computes how high up the target the view clears buildings, trees and the ground, giving the fraction of the target predicted visible. Heights are measured from the ground at the target's base, so cameras above or below the target are handled. A score combines visibility with distance (closer is better, scaled to the target's height) and ranks the views. Images taken before the target's `built_date`, if given, are decreased in weight.
+3. **Mapillary.** One search returns every image within `radius_m`. 360° panoramas are cropped locally to a view aimed at the target. Ordinary photos are kept only if the target lies inside their field of view. They are then used as taken, and `target_offset_deg` records where in the frame the target should be. The best views with at least `min_visible_fraction` of the target predicted visible are downloaded, at least `min_separation_m` apart, because neighbouring frames of one sequence share the same obstructions.
+4. **Google Street View**, only if Mapillary supplied fewer than `n_images`. Points are sampled every `road_spacing_m` along roads and scored locally first. Street View metadata is then queried at the best points only (`search="ranked"`), which is free but counts against quota. The best panoramas fill the remaining places.
 5. **Aiming.** Pitch and field of view are chosen so the visible part of the target fits in the frame. Close views are widened to allow for `position_uncertainty_m` of error in the target coordinates.
 
 ## Parameters
@@ -86,7 +88,7 @@ A provider without credentials is skipped with a message. On Windows, a Mapillar
 
 Each site gets its own run folder. The parent folder also gets `summary.csv` (one row per site: images found per provider, and the best view) and `summary.gpkg` (layers `sites`, `best_cameras` and `best_sight_lines`).
 
-Re-running a batch skips sites that already have their images; images already on disk are never downloaded again. `max_google_images_total` (`--max-google-images` with `--sites`) caps billed Google images across the batch; once it is used up, the remaining sites still get Mapillary images. A Google key or quota error, or a refused Mapillary token, stops the batch. Any other error is written to that site's `error.txt` and the batch continues.
+Re-running a batch skips sites that already have their images. Images already on disk are never downloaded again. `max_google_images_total` (`--max-google-images` with `--sites`) caps billed Google images across the batch. Once it is used up, the remaining sites still get Mapillary images. A Google key or quota error, or a refused Mapillary token, stops the batch. Any other error is written to that site's `error.txt` and the batch continues.
 
 ## Run folder
 
